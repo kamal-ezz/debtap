@@ -232,7 +232,7 @@ extract_deb_member data.tar.gz 'tar -xz'
                     result = self.bash('bash "$1" -Q "$2"', [script, deb])
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(error, result.stderr)
-                    self.assertNotIn('Package successfully created!', result.stdout)
+                    self.assertNotIn('Package successfully created', result.stdout)
                     self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [])
                     self.assertEqual(list(self.root.glob('.debtap-output.*')), [])
                     self.assertEqual(list(self.work_temp.iterdir()), [])
@@ -455,6 +455,132 @@ curl() {
 '''
         return helpers + mocks
 
+    def dependency_setup_script(self, missing='', install_status=0, still_missing='',
+                                euid=0):
+        # Exercise the actual -u branch with mocked commands and root status.
+        options = SOURCE[SOURCE.index('# Options, help, database'):
+                         SOURCE.index('elif [[ "${@: -1}" == "debtap" ]]')]
+        options = options.replace('$EUID != 0', '${test_euid:-0} != 0') + '\nfi\n'
+        mocks = '''
+command() {
+    if [[ $1 == -v ]]; then
+        case " $missing " in
+            *" $2 "*) [[ $installed == set && $2 != "$still_missing" ]] ;;
+            *) return 0 ;;
+        esac
+    else
+        builtin command "$@"
+    fi
+}
+pacman() {
+    printf '%s\\n' "$@" > installation-args
+    (( install_status == 0 )) || return "$install_status"
+    installed=set
+}
+update_database() { printf updated > database-updated; }
+'''
+        setup = ('missing=$1; install_status=$2; still_missing=$3; test_euid=$4; '
+                 'shift 4\n')
+        return HELPERS + mocks + setup + options, [missing, install_status, still_missing,
+                                                  euid, '-u']
+
+    def test_update_installs_missing_dependencies_and_continues(self):
+        code, args = self.dependency_setup_script('pkgfile pactree ar readelf zstd unzstd')
+        result = self.bash(code, args, input='yes\n')
+        self.assert_ok(result)
+        self.assertIn('pkgfile: pkgfile', result.stdout)
+        self.assertIn('pacman-contrib: pactree', result.stdout)
+        self.assertIn('binutils: ar readelf', result.stdout)
+        self.assertEqual((self.root / 'installation-args').read_text().splitlines(),
+                         ['-S', '--needed', '--', 'pkgfile', 'pacman-contrib', 'binutils',
+                          'zstd'])
+        self.assertTrue((self.root / 'database-updated').exists())
+
+    def test_update_with_dependencies_present_never_installs_or_prompts(self):
+        code, args = self.dependency_setup_script()
+        result = self.bash(code, args, input='')
+        self.assert_ok(result)
+        self.assertNotIn('Install these packages', result.stdout)
+        self.assertFalse((self.root / 'installation-args').exists())
+        self.assertTrue((self.root / 'database-updated').exists())
+
+    def test_update_declining_or_eof_never_installs_or_updates(self):
+        code, args = self.dependency_setup_script('pkgfile')
+        for answer in ('n\n', '\n', ''):
+            with self.subTest(answer=answer):
+                result = self.bash(code, args, input=answer)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('sudo pacman -S --needed pkgfile', result.stderr)
+                self.assertFalse((self.root / 'installation-args').exists())
+                self.assertFalse((self.root / 'database-updated').exists())
+
+    def test_update_quiet_flags_do_not_approve_installation(self):
+        for flag in ('-uq', '-uQ'):
+            with self.subTest(flag=flag):
+                code, args = self.dependency_setup_script('pkgfile')
+                args[-1] = flag
+                result = self.bash(code, args, input='')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Install these packages', result.stdout)
+                self.assertFalse((self.root / 'installation-args').exists())
+                self.assertFalse((self.root / 'database-updated').exists())
+
+    def test_update_install_failure_stops_before_database_changes(self):
+        code, args = self.dependency_setup_script('pkgfile', install_status=1)
+        result = self.bash(code, args, input='y\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Dependency installation failed', result.stderr)
+        self.assertFalse((self.root / 'database-updated').exists())
+
+    def test_update_rechecks_commands_after_installation(self):
+        code, args = self.dependency_setup_script('pkgfile', still_missing='pkgfile')
+        result = self.bash(code, args, input='Y\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('still unavailable after installation: pkgfile', result.stderr)
+        self.assertFalse((self.root / 'database-updated').exists())
+
+    def test_update_without_pacman_shows_setup_error(self):
+        code, args = self.dependency_setup_script('pacman pkgfile')
+        result = self.bash(code, args, input='y\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Dependency setup requires pacman', result.stderr)
+        self.assertFalse((self.root / 'installation-args').exists())
+        self.assertFalse((self.root / 'database-updated').exists())
+
+    def test_update_without_root_never_installs_or_updates(self):
+        code, args = self.dependency_setup_script('pkgfile', euid=1000)
+        result = self.bash(code, args, input='y\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('root privileges', result.stderr)
+        self.assertFalse((self.root / 'installation-args').exists())
+        self.assertFalse((self.root / 'database-updated').exists())
+
+    def test_missing_or_incomplete_databases_show_setup_instructions(self):
+        deb = self.make_deb()
+        for name in CACHE_NAMES + ['pkgfile']:
+            with self.subTest(database=name):
+                script = self.conversion_script()
+                if name == 'pkgfile':
+                    (self.root / 'pkgfile-cache/core.files.123').unlink()
+                else:
+                    (self.root / 'cache' / name).write_text('')
+                result = self.bash('bash "$1" -Q "$2"', [script, deb])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Package databases are missing, empty, or incomplete',
+                              result.stderr)
+                self.assertIn('sudo debtap -u', result.stderr)
+                self.assertNotIn('ls:', result.stderr)
+                self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [])
+
+    def test_pkgfile_update_failure_names_the_failed_step(self):
+        code = self.update_fixtures() + '\npkgfile() { return 1; }; update_database'
+        result = self.bash(code)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Could not update the pkgfile database', result.stderr)
+        for name in CACHE_NAMES:
+            self.assertEqual((self.root / 'cache' / name).read_text(), 'old cache\n')
+        self.assertEqual(list((self.root / 'cache').glob('.update.*')), [])
+
     def test_failed_updates_preserve_all_caches_and_clean_staging(self):
         code = self.update_fixtures()
         for failure in ('packages.ubuntu.com', 'sid/main', 'sid/non-free', 'sid/contrib',
@@ -462,6 +588,7 @@ curl() {
             with self.subTest(failure=failure):
                 result = self.bash(code + '\nfail=$1; update_database', [failure])
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('Error: Could not', result.stderr)
                 for name in CACHE_NAMES:
                     self.assertEqual((self.root / 'cache' / name).read_text(), 'old cache\n')
                 self.assertEqual(list((self.root / 'cache').glob('.update.*')), [])

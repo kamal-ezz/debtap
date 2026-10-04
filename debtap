@@ -23,8 +23,8 @@ lightred='\e[1;31m'
 red='\e[0;31m'
 lightblue='\e[1;34m'
 NC='\e[0m'
-bold=$(tput bold)
-normal=$(tput sgr0)
+bold=$(tput bold 2> /dev/null) || bold=
+normal=$(tput sgr0 2> /dev/null) || normal=
 
 # Move all entries, including dotfiles, without overwriting existing payloads.
 # A subshell keeps glob options local and preserves unmoved entries on failure.
@@ -84,45 +84,141 @@ extract_deb_member() (
 	ar p "$package_with_full_path" "$member" | "${extract_command[@]}"
 )
 
+# Offer to install missing runtime commands before updating databases.
+ensure_dependencies() {
+	local requirement package tool package_missing answer
+	local -a tools package_tools missing_tools=() missing_packages=() missing_details=()
+	local -a requirements=(
+		'pkgfile:pkgfile'
+		'pacman-contrib:pactree'
+		'binutils:ar readelf'
+		'fakeroot:fakeroot'
+		'namcap:namcap'
+		'curl:curl'
+		'gawk:awk gawk'
+		'grep:grep'
+		'sed:sed'
+		'tar:tar'
+		'libarchive:bsdtar'
+		'gzip:gzip'
+		'xz:xz'
+		'bzip2:bzip2'
+		'zstd:zstd unzstd'
+		'file:file'
+		'util-linux:rev'
+		'which:which'
+		'ncurses:tput'
+		'coreutils:basename cat chmod cp cut date dirname du head ln ls mkdir mktemp mv readlink realpath rm rmdir sort tac tail touch tr uname uniq wc'
+	)
+	printf '==> Checking required commands...\n'
+	if ! command -v pacman > /dev/null 2>&1; then
+		printf 'Error: Dependency setup requires pacman.\nRun debtap on Arch Linux or a compatible system with pacman available in PATH.\n' >&2
+		return 1
+	fi
+	for requirement in "${requirements[@]}"; do
+		package=${requirement%%:*}
+		read -r -a tools <<< "${requirement#*:}"
+		package_missing=
+		package_tools=()
+		for tool in "${tools[@]}"; do
+			if ! command -v "$tool" > /dev/null 2>&1; then
+				missing_tools+=("$tool")
+				package_tools+=("$tool")
+				package_missing=set
+			fi
+		done
+		if [[ -n $package_missing ]]; then
+			missing_packages+=("$package")
+			missing_details+=("$package: ${package_tools[*]}")
+		fi
+	done
+	(( ${#missing_packages[@]} )) || return 0
+	printf 'Missing dependencies (package: commands):\n'
+	printf '  %s\n' "${missing_details[@]}"
+	printf 'Install these packages with pacman? [y/N] '
+	if ! IFS= read -r answer; then answer=; fi
+	case $answer in
+		[yY]|[yY][eE][sS]) ;;
+		*)
+			printf '\nSetup cancelled: required commands are missing.\nInstall them manually: sudo pacman -S --needed %s\nThen retry: sudo debtap -u\n' "${missing_packages[*]}" >&2
+			return 1
+			;;
+	esac
+	# Keep pacman's own confirmation; never refresh only the sync database here.
+	if ! pacman -S --needed -- "${missing_packages[@]}"; then
+		printf 'Error: Dependency installation failed.\nThe database update has not started. Resolve the pacman error above, then retry: sudo debtap -u\n' >&2
+		return 1
+	fi
+	hash -r
+	for tool in "${missing_tools[@]}"; do
+		if ! command -v "$tool" > /dev/null 2>&1; then
+			printf 'Error: Required command is still unavailable after installation: %s\nCheck your PATH and package installation, then retry: sudo debtap -u\n' "$tool" >&2
+			return 1
+		fi
+	done
+	printf '==> Dependencies installed. Continuing with database update...\n'
+}
+
+# Test every required database without printing raw filesystem errors.
+databases_ready() {
+	local database
+	compgen -G '/var/cache/pkgfile/*.files*' > /dev/null || return 1
+	for database in /var/cache/debtap/debian-{main,non-free,contrib}-packages-files \
+		/var/cache/debtap/{ubuntu-packages-files,virtual-packages,aur-packages,extended-base-packages-list}; do
+		[[ -s $database ]] || return 1
+	done
+}
+
 # Build a complete replacement in a private directory before updating caches.
 update_database() (
 	set -o pipefail
-	local cache=/var/cache/debtap staging arch ubuntu_version ubuntu_host section name
+	local cache=/var/cache/debtap staging= arch ubuntu_version ubuntu_host section name
+	local step='prepare the database cache' status
 	local -a base_packages
+	trap 'status=$?; [[ -z $staging ]] || rm -rf -- "$staging"; if (( status != 0 )); then printf "Error: Could not %s.\n" "$step" >&2; fi' EXIT
 	mkdir -p "$cache" && chmod 755 "$cache" || return 1
 	staging=$(mktemp -d "$cache/.update.XXXXXXXX") || return 1
-	trap 'rm -rf -- "$staging"' EXIT
 
-	echo -e "${lightgreen}==>${NC} ${bold}Synchronizing pkgfile database...${normal}"
+	step='update the pkgfile database'
+	printf '==> Updating pkgfile database...\n'
 	pkgfile -u || return 1
+	step='select the package index architecture'
 	case $(uname -m) in
 		i686|x86_64) arch=amd64; ubuntu_host=archive.ubuntu.com/ubuntu ;;
 		armv7l|armv7h) arch=armhf; ubuntu_host=ports.ubuntu.com/ubuntu-ports ;;
 		aarch64) arch=arm64; ubuntu_host=ports.ubuntu.com/ubuntu-ports ;;
 		*) printf 'Error: Unsupported architecture\n' >&2; return 1 ;;
 	esac
-	echo -e "${lightgreen}==>${NC} ${bold}Synchronizing debtap database...${normal}"
+	step='determine the Ubuntu release'
+	printf '==> Checking Ubuntu release information...\n'
 	curl -fsSL https://packages.ubuntu.com -o "$staging/ubuntu-index" || return 1
 	ubuntu_version=$(grep option "$staging/ubuntu-index" | gawk -F '=' '{print $2}' | gawk '{print $1}' | grep -v option | tac | sed -n '3p' | sed 's/\("\|-updated\|-backports\)//g') || return 1
 	[[ $ubuntu_version =~ ^[a-z][a-z0-9-]*$ ]] || return 1
 	for section in main non-free contrib; do
+		step="update the Debian $section file index"
+		printf '==> Updating Debian %s file index...\n' "$section"
 		name="debian-$section-packages-files"
 		curl -fsSL "https://ftp.debian.org/debian/dists/sid/$section/Contents-$arch.gz" | gzip -dc > "$staging/$name" || return 1
 		[[ -s $staging/$name ]] || return 1
 	done
+	step="update the Ubuntu $ubuntu_version file index"
+	printf '==> Updating Ubuntu %s file index...\n' "$ubuntu_version"
 	curl -fsSL "https://$ubuntu_host/dists/$ubuntu_version/Contents-$arch.gz" | gzip -dc > "$staging/ubuntu-packages-files" || return 1
 	[[ -s $staging/ubuntu-packages-files ]] || return 1
 
-	echo -e "${lightgreen}==>${NC} ${bold}Downloading latest virtual packages list...${normal}"
+	step='update the virtual package list'
+	printf '==> Updating virtual package list...\n'
 	curl -fsSL https://github.com/helixarch/virtual-packages-list-generator/archive/master.tar.gz -o "$staging/master.tar.gz" || return 1
 	# Extract only the expected file, rather than arbitrary archive paths.
 	tar -xzOf "$staging/master.tar.gz" virtual-packages-list-generator-master/virtual-packages > "$staging/virtual-packages" || return 1
 	[[ -s $staging/virtual-packages ]] || return 1
-	echo -e "${lightgreen}==>${NC} ${bold}Downloading latest AUR packages list...${normal}"
+	step='update the AUR package list'
+	printf '==> Updating AUR package list...\n'
 	curl -fsSL https://aur.archlinux.org/packages.gz | gzip -dc > "$staging/aur-packages" || return 1
 	[[ -s $staging/aur-packages ]] || return 1
 
-	echo -e "${lightgreen}==>${NC} ${bold}Generating extended base group packages list...${normal}"
+	step='generate the base dependency list'
+	printf '==> Building base dependency list...\n'
 	pacman -Qi base > "$staging/base-info" || return 1
 	read -r -a base_packages <<< "$(sed -n 's/^Depends[^:]*:[[:space:]]*//p' "$staging/base-info")"
 	[[ ${#base_packages[@]} -gt 0 && ${base_packages[0]} != None ]] || return 1
@@ -132,6 +228,7 @@ update_database() (
 	sort -u "$staging/base-tree" > "$staging/extended-base-packages-list" || return 1
 	[[ -s $staging/extended-base-packages-list ]] || return 1
 	printf '\n' >> "$staging/extended-base-packages-list" || return 1
+	step='publish the updated databases'
 	for name in debian-{main,non-free,contrib}-packages-files ubuntu-packages-files virtual-packages aur-packages extended-base-packages-list; do
 		chmod 644 "$staging/$name" || return 1
 	done
@@ -225,11 +322,11 @@ if [[ $output == set ]]; then
 	for ((i=0; i<${#optionsarray[@]}; i++)); do
 		if [[ "${optionsarray[$i]}" =~ ^-o$ ]] || [[ "${optionsarray[$i]}" =~ ^--output$ ]]; then
 			if [[ "${optionsarray[$i+1]}" == "" ]]; then
-				echo -e "${red}Error: You haven't specified an output directory${NC}"; exit 1;
+				printf 'Error: -o/--output needs a directory.\nExample: debtap -o ./output package.deb\n' >&2; exit 1;
 			elif [ -d "${optionsarray[$i+1]}" ]; then
 				outputdirectory="$(realpath "${optionsarray[$i+1]}")"
 			else
-				echo -e "${red}Error: No output directory or invalid output directory${NC}"; exit 1;
+				printf 'Error: Output directory does not exist: %s\nCreate it first or choose an existing directory.\n' "${optionsarray[$i+1]}" >&2; exit 1;
 			fi
 		fi
 	done
@@ -238,31 +335,32 @@ if [[ $pseudo == set ]] && [[ ! -e /var/lib/pacman/sync/multilib.db ]] && [[ ! -
 	echo -e "${red}Error: You are either running non-x86_64 Arch Linux, or you haven't enabled multilib repository. If you are running x86_64 Arch Linux, you must enable a multilib repository and then synchronize pacman database${NC}"; exit 1
 fi
 if [[ $help == set ]]; then
-	echo -e "Syntax: debtap -o output_directory [other_options] package_filename\n\nOptions:\n\n    -h  --help        Print this help message\n    -u  --update      Update debtap database\n    -q  --quiet       Bypass all questions, except for editing metadata file(s)\n    -Q  --Quiet       Bypass all questions (not recommended)\n    -s  --pseudo      Create a pseudo-64-bit package from a 32-bit .deb package\n    -w  --wipeout     Wipeout versions from all dependencies, conflicts etc.\n    -p  --pkgbuild    Additionally generate a PKGBUILD file\n    -P  --Pkgbuild    Generate a PKGBUILD file only\n    -o  --output      Output directory for generated package and/or PKGBUILD (optional)\n    -v  --version     Print version"; exit 0
+	echo -e "Usage: debtap [options] package.deb\n\nOptions:\n\n    -h  --help        Show help\n    -u  --update      Check dependencies and update databases\n    -q  --quiet       Bypass all questions, except for editing metadata file(s)\n    -Q  --Quiet       Bypass all questions (not recommended)\n    -s  --pseudo      Create a pseudo-64-bit package from a 32-bit .deb package\n    -w  --wipeout     Wipeout versions from all dependencies, conflicts etc.\n    -p  --pkgbuild    Additionally generate a PKGBUILD file\n    -P  --Pkgbuild    Generate a PKGBUILD file only\n    -o  --output      Output directory for generated package and/or PKGBUILD (optional)\n    -v  --version     Print version"; exit 0
 elif [[ $version == set ]]; then
 	echo -e "$Version"; exit 0
 elif [[ $update == set ]]; then
     if [[ $EUID != 0 ]]; then
-        echo -e "${red}Error: You must run this command with root privileges${NC}"; exit 1
+        printf 'Error: Updating databases requires root privileges.\nRun: sudo debtap -u\n' >&2; exit 1
+    elif ! ensure_dependencies; then
+        exit 1
     elif ! update_database; then
-        echo -e "${red}Synchronization failed. Exiting...${NC}"; exit 1
+        printf 'Database update incomplete. Resolve the error above, then retry: sudo debtap -u\n' >&2; exit 1
     else
-        echo -e "${lightgreen}==>${NC} ${bold}All steps successfully completed!${normal}"; exit 0
+        printf '==> Package databases are up to date. You can now convert a .deb package.\n'; exit 0
     fi
-elif [[ "${@: -1}" == "debtap" ]] || [[ "${@: -1}" =~ /debtap$ ]] || [[ "${@: -1}" =~ ^-([qQswpPo]+)$ ]] || [[ "${@: -1}" =~ ^--([quiet|Quiet|pseudo|wipeout|pkgbuild|Pkgbuild|output]){1,}$ ]] || [[ "${@: -1}" =~ ^-(o+)$ ]] || [[ "${@: -1}" =~ ^--(output){1,}$ ]] || [[ -d "${@: -1}" ]]; then
-	echo -e "${red}Error: You haven't specified a deb package${NC}\nSyntax: debtap -o output_directory [other_options] package_filename\n\nOptions:\n\n    -h  --help        Print this help message\n    -u  --update      Update debtap database\n    -q  --quiet       Bypass all questions, except for editing metadata file(s)\n    -Q  --Quiet       Bypass all questions (not recommended)\n    -s  --pseudo      Create a pseudo-64-bit package from a 32-bit .deb package\n    -w  --wipeout     Wipeout versions from all dependencies, conflicts etc.\n    -p  --pkgbuild    Additionally generate a PKGBUILD file\n    -P  --Pkgbuild    Generate a PKGBUILD file only\n    -o  --output      Output directory for generated package and/or PKGBUILD (optional)\n    -v  --version     Print version"; exit 1
-elif [[ "${@: -1}" =~ ^(-)+(.)*$ ]] || [[ $(ls "${@: -1}" &> /dev/null; echo $?) != 0 ]]; then
-	echo -e "${red}Error: No such file or directory or invalid option${NC}"; exit 1
+elif [[ "${@: -1}" == "debtap" ]] || [[ $# -eq 0 ]] || [[ "${@: -1}" =~ /debtap$ ]] || [[ "${@: -1}" =~ ^-([qQswpPo]+)$ ]] || [[ "${@: -1}" =~ ^--([quiet|Quiet|pseudo|wipeout|pkgbuild|Pkgbuild|output]){1,}$ ]] || [[ "${@: -1}" =~ ^-(o+)$ ]] || [[ "${@: -1}" =~ ^--(output){1,}$ ]] || [[ -d "${@: -1}" ]]; then
+	printf 'Error: No .deb package was specified.\nUsage: debtap [options] package.deb\nRun debtap --help for available options.\n' >&2; exit 1
+elif [[ "${@: -1}" == -* ]]; then
+	printf 'Error: Unrecognized option: %s\nRun debtap --help for available options.\n' "${@: -1}" >&2; exit 1
+elif [[ ! -f "${@: -1}" || ! -r "${@: -1}" ]]; then
+	printf 'Error: Cannot read package file: %s\nCheck that the file exists and you have permission to read it.\n' "${@: -1}" >&2; exit 1
 elif [[ $(file -S -b "${@: -1}" | grep -q "Debian binary package"; echo $?) != 0 ]]; then
-	echo -e "${red}Error: You haven't specified a valid deb package${NC}"; exit 1
+	printf 'Error: File is not a valid Debian package: %s\n' "${@: -1}" >&2; exit 1
 fi
 
-if [[ ! $(ls /var/cache/pkgfile | grep -E '*.files?(.[[:digit:]]{3})' 2> /dev/null) ]] || [[ ! $(ls /var/cache/debtap/*-packages-files 2> /dev/null) ]] || [[ ! -e /var/cache/debtap/extended-base-packages-list ]] || [[ ! -e /var/cache/debtap/aur-packages ]] || [[ ! -e /var/cache/debtap/virtual-packages ]]; then
-	if [[ $pseudo != set ]]; then
-		echo -e "${red}Error: You must run at least once \"debtap -u\" with root privileges (preferably recently), before running this script${NC}"; exit 1
-	else
-		echo -e "${red}Error: You must enable a multilib repository, synchronize pacman database and then run at least once \"debtap -u\" with root privileges (preferably recently), before running this script${NC}"; exit 1
-	fi
+if ! databases_ready; then
+	printf 'Error: Package databases are missing, empty, or incomplete.\nInitialize them first: sudo debtap -u\nThen rerun your conversion command without sudo.\n' >&2
+	exit 1
 fi
 
 tar_extract_cmd() {
@@ -344,7 +442,7 @@ for metadata_file in .PKGINFO .INSTALL .MTREE; do
 done
 
 # Fixing possible differences in filesystem hierarchy of the extracted package data, so that it matches Arch Linux filesystem hierarchy
-echo -e "${lightgreen}==>${NC} ${bold}Fixing possible directories structure differencies...${normal}"
+echo -e "${lightgreen}==>${NC} ${bold}Adjusting package paths for Arch Linux...${normal}"
 if [[ $pkgbuild == set ]] || [[ $Pkgbuild == set ]]; then
 	if [[ $(find ./ -iname '*license*' | wc -l) != 0 ]]; then
 		printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*license*' | sort | tail -1 | sed s'/^\.\///')" >> "$scratch_directory/pkgbuildinstallations1"
@@ -644,7 +742,7 @@ else
     done
 fi
 
-echo -e "\n${lightgreen}***${NC} ${bold}Creation of .PKGINFO file in progress. It may take a few minutes, please wait...${normal}"
+echo -e "\n${lightgreen}***${NC} ${bold}Resolving package dependencies. This may take a few minutes...${normal}"
 
 # The packages names translator function
 packages-names-translator() {
@@ -3148,7 +3246,7 @@ if [[ $(cat "$report_directory/provisions-untranslated-names-only") != "" ]]; th
 fi
 
 # Generating .INSTALL file (if necessary)
-echo -e "\n${lightgreen}==>${NC} ${bold}Checking and generating .INSTALL file (if necessary)...${normal}"
+echo -e "\n${lightgreen}==>${NC} ${bold}Checking package install scripts...${normal}"
 
 SAVEIFS=$IFS
 IFS=$'\n'
@@ -3365,7 +3463,7 @@ fi
 
 # Announcement of successful creation of package
 if [[ $Pkgbuild != set ]]; then
-	echo -e "${lightgreen}==>${NC} ${bold}Package successfully created!${normal}"
+	printf '==> Package successfully created: %s/%s\n' "$package_destination" "$package_filename"
 fi
 
 if [[ $pkgbuild != set ]] && [[ $Pkgbuild != set ]]; then

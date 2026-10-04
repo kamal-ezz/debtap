@@ -19,7 +19,13 @@ A script for converting .deb packages into Arch Linux packages, focused on accur
 
 **Q: What are the minimum requirements to run this script?**
 
-**A:** You need to have installed these dependencies: `bash`, `binutils` (provides ar utility for extracting .deb package and readelf), `pkgfile` and `fakeroot`.You must run at least once (preferably recently) `debtap -u` to create/update pkgfile and debtap database (you do this with root privileges).
+**A:** Run `sudo debtap -u` at least once (preferably recently) to create/update
+the pkgfile and debtap databases. This checks the commands required for updating
+and conversion, lists any missing commands and their Arch packages, and offers
+to install them using `pacman -S --needed`. Installation requires your approval
+and keeps pacman's normal confirmation prompt. Declining, providing no input,
+or a failed installation stops the update. Quiet options do not bypass this
+installation prompt. Conversion itself does not install packages.
 
 **Q: Debtap needs a lot of time to convert a package. So, why this is happening?**
 
@@ -55,7 +61,7 @@ Available options:
 ==================
 
     -h  --help        Prints help
-    -u  --update      Update debtap database
+    -u  --update      Check dependencies and update databases
     -q  --quiet       Bypass all questions, except for editing metadata file(s)
     -Q  --Quiet       Bypass all questions (not recommended)
     -s  --pseudo      Create a pseudo-64-bit package from a 32-bit .deb package
