@@ -26,10 +26,123 @@ NC='\e[0m'
 bold=$(tput bold)
 normal=$(tput sgr0)
 
+# Move all entries, including dotfiles, without overwriting existing payloads.
+# A subshell keeps glob options local and preserves unmoved entries on failure.
+migrate_directory() (
+	local source=$1 destination=$2 entry target
+	shopt -s dotglob nullglob
+	mkdir -p -- "$destination" || return 1
+	for entry in "$source"/*; do
+		target="$destination/${entry##*/}"
+		if [[ -d $entry && ! -L $entry && -d $target && ! -L $target ]]; then
+			migrate_directory "$entry" "$target" || return 1
+			continue
+		fi
+		if [[ -e $target || -L $target ]]; then
+			printf 'Error: Cannot migrate %s: destination %s already exists\n' "$entry" "$target" >&2
+			return 1
+		fi
+		mv -- "$entry" "$target" || return 1
+	done
+	rmdir -- "$source"
+)
+
+# Read complete metadata values and serialize them as literal Bash values.
+pkginfo_values() {
+	local line
+	while IFS= read -r line; do
+		if [[ $line == "$1 = "* ]]; then
+			printf '%s\n' "${line#"$1 = "}"
+		fi
+	done < .PKGINFO
+}
+
+write_pkgbuild_scalar() {
+	printf '%s=%q\n' "$1" "$2" >> PKGBUILD
+}
+
+write_pkgbuild_array() {
+	local name=$1 value
+	shift
+	{
+		printf '%s=(' "$name"
+		for value in "$@"; do printf '%q ' "$value"; done
+		printf ')\n'
+	} >> PKGBUILD
+}
+
+print_package_report() {
+	awk 'NF { for (i = 1; i <= NF; i++) { printf "%s%s", separator, $i; separator = ", " } } END { print "" }' "$1"
+}
+
+# Pipe failure checks are local to archive extraction, not unrelated pipelines.
+extract_deb_member() (
+	set -o pipefail
+	local member=$1 command=$2
+	local -a extract_command
+	read -r -a extract_command <<< "$command"
+	ar p "$package_with_full_path" "$member" | "${extract_command[@]}"
+)
+
+# Build a complete replacement in a private directory before updating caches.
+update_database() (
+	set -o pipefail
+	local cache=/var/cache/debtap staging arch ubuntu_version ubuntu_host section name
+	local -a base_packages
+	mkdir -p "$cache" && chmod 755 "$cache" || return 1
+	staging=$(mktemp -d "$cache/.update.XXXXXXXX") || return 1
+	trap 'rm -rf -- "$staging"' EXIT
+
+	echo -e "${lightgreen}==>${NC} ${bold}Synchronizing pkgfile database...${normal}"
+	pkgfile -u || return 1
+	case $(uname -m) in
+		i686|x86_64) arch=amd64; ubuntu_host=archive.ubuntu.com/ubuntu ;;
+		armv7l|armv7h) arch=armhf; ubuntu_host=ports.ubuntu.com/ubuntu-ports ;;
+		aarch64) arch=arm64; ubuntu_host=ports.ubuntu.com/ubuntu-ports ;;
+		*) printf 'Error: Unsupported architecture\n' >&2; return 1 ;;
+	esac
+	echo -e "${lightgreen}==>${NC} ${bold}Synchronizing debtap database...${normal}"
+	curl -fsSL https://packages.ubuntu.com -o "$staging/ubuntu-index" || return 1
+	ubuntu_version=$(grep option "$staging/ubuntu-index" | gawk -F '=' '{print $2}' | gawk '{print $1}' | grep -v option | tac | sed -n '3p' | sed 's/\("\|-updated\|-backports\)//g') || return 1
+	[[ $ubuntu_version =~ ^[a-z][a-z0-9-]*$ ]] || return 1
+	for section in main non-free contrib; do
+		name="debian-$section-packages-files"
+		curl -fsSL "https://ftp.debian.org/debian/dists/sid/$section/Contents-$arch.gz" | gzip -dc > "$staging/$name" || return 1
+		[[ -s $staging/$name ]] || return 1
+	done
+	curl -fsSL "https://$ubuntu_host/dists/$ubuntu_version/Contents-$arch.gz" | gzip -dc > "$staging/ubuntu-packages-files" || return 1
+	[[ -s $staging/ubuntu-packages-files ]] || return 1
+
+	echo -e "${lightgreen}==>${NC} ${bold}Downloading latest virtual packages list...${normal}"
+	curl -fsSL https://github.com/helixarch/virtual-packages-list-generator/archive/master.tar.gz -o "$staging/master.tar.gz" || return 1
+	# Extract only the expected file, rather than arbitrary archive paths.
+	tar -xzOf "$staging/master.tar.gz" virtual-packages-list-generator-master/virtual-packages > "$staging/virtual-packages" || return 1
+	[[ -s $staging/virtual-packages ]] || return 1
+	echo -e "${lightgreen}==>${NC} ${bold}Downloading latest AUR packages list...${normal}"
+	curl -fsSL https://aur.archlinux.org/packages.gz | gzip -dc > "$staging/aur-packages" || return 1
+	[[ -s $staging/aur-packages ]] || return 1
+
+	echo -e "${lightgreen}==>${NC} ${bold}Generating extended base group packages list...${normal}"
+	pacman -Qi base > "$staging/base-info" || return 1
+	read -r -a base_packages <<< "$(sed -n 's/^Depends[^:]*:[[:space:]]*//p' "$staging/base-info")"
+	[[ ${#base_packages[@]} -gt 0 && ${base_packages[0]} != None ]] || return 1
+	for name in "${base_packages[@]}"; do
+		pactree -lu "$name" >> "$staging/base-tree" || return 1
+	done
+	sort -u "$staging/base-tree" > "$staging/extended-base-packages-list" || return 1
+	[[ -s $staging/extended-base-packages-list ]] || return 1
+	printf '\n' >> "$staging/extended-base-packages-list" || return 1
+	for name in debian-{main,non-free,contrib}-packages-files ubuntu-packages-files virtual-packages aur-packages extended-base-packages-list; do
+		chmod 644 "$staging/$name" || return 1
+	done
+	for name in debian-{main,non-free,contrib}-packages-files ubuntu-packages-files virtual-packages aur-packages extended-base-packages-list; do
+		mv -fT -- "$staging/$name" "$cache/$name" || return 1
+	done
+)
+
 # Options, help, database update and error messages
-optionsarray=()
+optionsarray=("$@")
 for i in "$@"; do
-	optionsarray+=($@)
 	if [[ "$i" =~ ^-([huqQswpPv]*)h([huqQswpPv]*)$ ]] || [[ "$i" =~ ^--help$ ]]; then
 		help=set
 	fi
@@ -62,7 +175,7 @@ for i in "$@"; do
 	fi
 done
 if [[ $output == set ]]; then
-	for i in $(eval echo {0..$((${#optionsarray[@]}-1))}); do
+	for ((i=0; i<${#optionsarray[@]}; i++)); do
 		if [[ "${optionsarray[$i]}" =~ ^-o$ ]] || [[ "${optionsarray[$i]}" =~ ^--output$ ]]; then
 			if [[ "${optionsarray[$i+1]}" == "" ]]; then
 				echo -e "${red}Error: You haven't specified an output directory${NC}"; exit 1;
@@ -84,64 +197,10 @@ elif [[ $version == set ]]; then
 elif [[ $update == set ]]; then
     if [[ $EUID != 0 ]]; then
         echo -e "${red}Error: You must run this command with root privileges${NC}"; exit 1
+    elif ! update_database; then
+        echo -e "${red}Synchronization failed. Exiting...${NC}"; exit 1
     else
-        mkdir -p /var/cache/debtap 2> /dev/null
-        chmod 755 /var/cache/debtap
-        echo -e "${lightgreen}==>${NC} ${bold}Synchronizing pkgfile database...${normal}"
-        pkgfile -u
-        if [[ $? != 0 ]]; then
-            echo -e "${red}Synchronization failed. Exiting...${NC}"; exit 1
-        else
-            echo -e "${lightgreen}==>${NC} ${bold}Synchronizing debtap database...${normal}"
-            if [[ "$(uname -m)" == "i686" ]] || [[ "$(uname -m)" == "x86_64" ]]; then
-                _arch=amd64
-            elif [[ "$(uname -m)" == "armv7l" ]] || [[ "$(uname -m)" == "armv7h" ]]; then
-                _arch=armhf
-            elif [[ "$(uname -m)" == "aarch64" ]]; then
-                _arch=arm64
-            fi
-            ubuntu_latest_stable_version=$(curl -k -s https://packages.ubuntu.com | grep option | gawk -F '=' '{print $2}' | gawk '{print $1}' | grep -v option | tac | sed -n 3'{p;q;}' | sed s'/\("\|-updated\|-backports\)//g')
-            curl -k -C - -f http://ftp.debian.org/debian/dists/sid/main/Contents-$_arch.gz > /var/cache/debtap/debian-main-packages-files.gz
-            gzip -df /var/cache/debtap/debian-main-packages-files.gz
-            curl -k -C - -f http://ftp.debian.org/debian/dists/sid/non-free/Contents-$_arch.gz > /var/cache/debtap/debian-non-free-packages-files.gz
-            gzip -df /var/cache/debtap/debian-non-free-packages-files.gz
-            curl -k -C - -f http://ftp.debian.org/debian/dists/sid/contrib/Contents-$_arch.gz > /var/cache/debtap/debian-contrib-packages-files.gz
-            gzip -df /var/cache/debtap/debian-contrib-packages-files.gz
-            if [[ $_arch == amd64 ]]; then
-                curl -k -C - -f http://archive.ubuntu.com/ubuntu/dists/$ubuntu_latest_stable_version/Contents-$_arch.gz > /var/cache/debtap/ubuntu-packages-files.gz
-            else
-                curl -k -C - -f http://ports.ubuntu.com/ubuntu-ports/dists/$ubuntu_latest_stable_version/Contents-$_arch.gz > /var/cache/debtap/ubuntu-packages-files.gz
-            fi
-            gzip -df /var/cache/debtap/ubuntu-packages-files.gz
-            if [[ $? != 0 ]]; then
-                echo -e "${red}Synchronization failed. Exiting...${NC}"; exit 1
-            else
-                echo -e "${lightgreen}==>${NC} ${bold}Downloading latest virtual packages list...${normal}"
-                curl -k -L https://github.com/helixarch/virtual-packages-list-generator/archive/master.tar.gz > /var/cache/debtap/master.tar.gz
-                tar xfz /var/cache/debtap/master.tar.gz -C /var/cache/debtap
-                mv /var/cache/debtap/virtual-packages-list-generator-master/virtual-packages /var/cache/debtap
-                rm -rf /var/cache/debtap/master.tar.gz /var/cache/debtap/virtual-packages-list-generator-master
-                if [[ $? != 0 ]]; then
-                    echo -e "${red}Downloading failed. Exiting...${NC}"; exit 1
-                else
-                    echo -e "${lightgreen}==>${NC} ${bold}Downloading latest AUR packages list...${normal}"
-                    curl -k -C - -f https://aur.archlinux.org/packages.gz > /var/cache/debtap/aur-packages.gz
-                    gzip -df /var/cache/debtap/aur-packages.gz
-                    if [[ $? != 0 ]]; then
-                        echo -e "${red}Downloading failed. Exiting...${NC}"; exit 1
-                    else
-                        echo -e "${lightgreen}==>${NC} ${bold}Generating extended base group packages list...${normal}"
-                        rm -rf /var/cache/debtap/extended-base-packages-list
-                        for i in $(pacman -Qi base 2> /dev/null | grep ^Depends | cut -d: -f2); do echo "$i" >> /var/cache/debtap/base-packages; done
-                        for i in $(cat /var/cache/debtap/base-packages); do pactree -lu "$i" >> /var/cache/debtap/extended-base-packages-list-temp; done
-                        sort -u /var/cache/debtap/extended-base-packages-list-temp > /var/cache/debtap/extended-base-packages-list; echo >> /var/cache/debtap/extended-base-packages-list
-                        rm -rf /var/cache/debtap/base-packages /var/cache/debtap/extended-base-packages-list-temp
-                        chmod 644 /var/cache/debtap/*
-                        echo -e "${lightgreen}==>${NC} ${bold}All steps successfully completed!${normal}"; exit 0
-                    fi
-                fi
-            fi
-        fi
+        echo -e "${lightgreen}==>${NC} ${bold}All steps successfully completed!${normal}"; exit 0
     fi
 elif [[ "${@: -1}" == "debtap" ]] || [[ "${@: -1}" =~ /debtap$ ]] || [[ "${@: -1}" =~ ^-([qQswpPo]+)$ ]] || [[ "${@: -1}" =~ ^--([quiet|Quiet|pseudo|wipeout|pkgbuild|Pkgbuild|output]){1,}$ ]] || [[ "${@: -1}" =~ ^-(o+)$ ]] || [[ "${@: -1}" =~ ^--(output){1,}$ ]] || [[ -d "${@: -1}" ]]; then
 	echo -e "${red}Error: You haven't specified a deb package${NC}\nSyntax: debtap -o output_directory [other_options] package_filename\n\nOptions:\n\n    -h  --help        Print this help message\n    -u  --update      Update debtap database\n    -q  --quiet       Bypass all questions, except for editing metadata file(s)\n    -Q  --Quiet       Bypass all questions (not recommended)\n    -s  --pseudo      Create a pseudo-64-bit package from a 32-bit .deb package\n    -w  --wipeout     Wipeout versions from all dependencies, conflicts etc.\n    -p  --pkgbuild    Additionally generate a PKGBUILD file\n    -P  --Pkgbuild    Generate a PKGBUILD file only\n    -o  --output      Output directory for generated package and/or PKGBUILD (optional)\n    -v  --version     Print version"; exit 1
@@ -200,7 +259,11 @@ if [ $? != 0 ]; then
     rm -rf "$working_directory"
     exit 1
 fi
-ar p "$package_with_full_path" "$control_tar_check" | $control_extract
+if ! extract_deb_member "$control_tar_check" "$control_extract" || [[ ! -f control ]]; then
+    echo -e "${red}Error: Cannot extract package metadata. Exiting...${NC}" >&2
+    rm -rf "$working_directory"
+    exit 1
+fi
 
 if [[ $pseudo == set ]] && [[ $(grep ^Architecture: control | grep -q i386; echo $?) != 0 ]]; then
     echo -e "${red}Error: Invalid package architecture. Removing extracted package data and exiting...${NC}"
@@ -215,133 +278,137 @@ if [ $? != 0 ]; then
     rm -rf "$working_directory"
     exit 1
 fi
-ar p "$package_with_full_path" "$data_tar_check" | $data_extract
+if ! extract_deb_member "$data_tar_check" "$data_extract"; then
+    echo -e "${red}Error: Cannot extract package data. Exiting...${NC}" >&2
+    rm -rf "$working_directory"
+    exit 1
+fi
 
 # Fixing possible differences in filesystem hierarchy of the extracted package data, so that it matches Arch Linux filesystem hierarchy
 echo -e "${lightgreen}==>${NC} ${bold}Fixing possible directories structure differencies...${normal}"
 if [[ $pkgbuild == set ]] || [[ $Pkgbuild == set ]]; then
 	if [[ $(find ./ -iname '*license*' | wc -l) != 0 ]]; then
-		echo "install -D -m644 \"$(find ./ -iname '*license*' | sort | tail -1 | sed s'/^\.\///')\" \"\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE\"" >> pkgbuildinstallations1
+		printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*license*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
 	fi
 	if [[ $(find ./ -iname '*copyright*' | wc -l) != 0 ]]; then
 		if [[ $(find ./ -iname '*license*' | wc -l) != 0 ]]; then
-			echo "install -D -m644 \"$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')\" \"\${pkgdir}/usr/share/licenses/\${pkgname}/COPYRIGHT\"" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/COPYRIGHT" || return 1\n' "$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
 		else
-			echo "install -D -m644 \"$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')\" \"\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE\"" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ $(find ./ -iname '*eula*' | wc -l) != 0 ]]; then
 		if [[ $(find ./ -iname '*license*' | wc -l) != 0 ]] || [[ $(find ./ -iname '*copyright*' | wc -l) != 0 ]]; then
-			echo "install -D -m644 \"$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')\" \"\${pkgdir}/usr/share/licenses/\${pkgname}/EULA\"" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/EULA" || return 1\n' "$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
 		else
-			echo "install -D -m644 \"$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')\" \"\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE\"" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ -e usr/games ]]; then
-		echo 'mkdir usr/bin 2> /dev/null; mv usr/games/* usr/bin; rm -rf usr/games' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/games usr/bin || return 1' >> pkgbuildinstallations1
 		if [[ -e usr/share/applications ]]; then
 			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/games\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ -e bin ]]; then
-		echo 'mkdir -p usr/bin 2> /dev/null; mv bin/* usr/bin; rm -rf bin' >> pkgbuildinstallations1
+		echo 'migrate_directory bin usr/bin || return 1' >> pkgbuildinstallations1
 		if [[ -e usr/share/applications ]]; then
 			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/bin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ -e sbin ]]; then
-		echo 'mkdir -p usr/bin 2> /dev/null; mv sbin/* usr/bin; rm -rf sbin' >> pkgbuildinstallations1
+		echo 'migrate_directory sbin usr/bin || return 1' >> pkgbuildinstallations1
 		if [[ -e usr/share/applications ]]; then
 			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ -e usr/sbin ]]; then
-		echo 'mkdir usr/bin 2> /dev/null; mv usr/sbin/* usr/bin; rm -rf usr/sbin' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/sbin usr/bin || return 1' >> pkgbuildinstallations1
 		if [[ -e usr/share/applications ]]; then
 			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ -e usr/local/games ]]; then
-		echo 'mkdir usr/bin 2> /dev/null; mv usr/local/games/* usr/bin; rm -rf usr/local/games' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/local/games usr/bin || return 1' >> pkgbuildinstallations1
 		if [[ -e usr/share/applications ]]; then
 			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/games\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ -e usr/local/bin ]]; then
-		echo 'mkdir usr/bin 2> /dev/null; mv usr/local/bin/* usr/bin; rm -rf usr/local/bin' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/local/bin usr/bin || return 1' >> pkgbuildinstallations1
 		if [[ -e usr/share/applications ]]; then
 			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/bin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ -e usr/local/sbin ]]; then
-		echo 'mkdir usr/bin 2> /dev/null; mv usr/local/sbin/* usr/bin; rm -rf usr/local/sbin' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/local/sbin usr/bin || return 1' >> pkgbuildinstallations1
 		if [[ -e usr/share/applications ]]; then
 			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
 		fi
 	fi
 	if [[ $pseudo != set ]]; then
 		if [[ -e lib ]]; then
-			echo 'mkdir -p usr/lib 2> /dev/null; mv lib/* usr/lib; rm -rf lib' >> pkgbuildinstallations1
+			echo 'migrate_directory lib usr/lib || return 1' >> pkgbuildinstallations1
 		fi
 		if [[ -e lib32 ]]; then
 			if [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-				echo 'mkdir -p usr/lib 2> /dev/null; mv lib32/* usr/lib; rm -rf lib32' >> pkgbuildinstallations32
+				echo 'migrate_directory lib32 usr/lib || return 1' >> pkgbuildinstallations32
 			else
-				echo 'mkdir -p usr/lib32 2> /dev/null; mv lib32/* usr/lib32; rm -rf lib32' >> pkgbuildinstallations64
+				echo 'migrate_directory lib32 usr/lib32 || return 1' >> pkgbuildinstallations64
 			fi
 		fi
 		if [[ -e lib64 ]]; then
-			echo 'mkdir -p usr/lib 2> /dev/null; mv lib64/* usr/lib; rm -rf lib64' >> pkgbuildinstallations64
+			echo 'migrate_directory lib64 usr/lib || return 1' >> pkgbuildinstallations64
 		fi
 		if [[ -e usr/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-			echo 'mkdir usr/lib 2> /dev/null; mv usr/lib32/* usr/lib; rm -rf usr/lib32' >> pkgbuildinstallations32
+			echo 'migrate_directory usr/lib32 usr/lib || return 1' >> pkgbuildinstallations32
 		fi
 		if [[ -e usr/lib64 ]]; then
-			echo 'mkdir usr/lib 2> /dev/null; mv usr/lib64/* usr/lib; rm -rf usr/lib64' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/lib64 usr/lib || return 1' >> pkgbuildinstallations64
 		fi
 		if [[ -e usr/local/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-			echo 'mkdir usr/local/lib 2> /dev/null; mv usr/local/lib32/* usr/local/lib; rm -rf usr/local/lib32' >> pkgbuildinstallations32
+			echo 'migrate_directory usr/local/lib32 usr/local/lib || return 1' >> pkgbuildinstallations32
 		fi
 		if [[ -e usr/local/lib64 ]]; then
-			echo 'mkdir usr/local/lib 2> /dev/null; mv usr/local/lib64/* usr/local/lib; rm -rf usr/local/lib64' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/local/lib64 usr/local/lib || return 1' >> pkgbuildinstallations64
 		fi
 	else
 		if [[ -e lib ]]; then
-			tac pkgbuildinstallations32 2> /dev/null >> pkgbuildinstallations32-1; echo 'mkdir -p usr/lib 2> /dev/null; mv lib/* usr/lib; rm -rf lib' >> pkgbuildinstallations32-1; tac pkgbuildinstallations32-1 > pkgbuildinstallations32; rm -rf pkgbuildinstallations32-1
-			echo 'mkdir -p usr/lib32 2> /dev/null; mv lib/* usr/lib32; rm -rf lib' >> pkgbuildinstallations64
+			tac pkgbuildinstallations32 2> /dev/null >> pkgbuildinstallations32-1; echo 'migrate_directory lib usr/lib || return 1' >> pkgbuildinstallations32-1; tac pkgbuildinstallations32-1 > pkgbuildinstallations32; rm -rf pkgbuildinstallations32-1
+			echo 'migrate_directory lib usr/lib32 || return 1' >> pkgbuildinstallations64
 		fi
 		if [[ -e lib32 ]]; then
-			echo 'mkdir -p usr/lib32 2> /dev/null; mv lib32/* usr/lib32; rm -rf lib32' >> pkgbuildinstallations64
+			echo 'migrate_directory lib32 usr/lib32 || return 1' >> pkgbuildinstallations64
 		fi
 		if [[ -e usr/lib ]]; then
-			echo 'mkdir usr/lib32 2> /dev/null; mv usr/lib/* usr/lib32; rm -rf usr/lib' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/lib usr/lib32 || return 1' >> pkgbuildinstallations64
 		fi
 		if [[ -e usr/local/lib ]]; then
-			echo 'mkdir usr/local/lib32 2> /dev/null; mv usr/local/lib/* usr/local/lib32; rm -rf usr/local/lib' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/local/lib usr/local/lib32 || return 1' >> pkgbuildinstallations64
 		fi
 	fi
 fi
 
 if [[ -e usr/games ]]; then
-	mkdir usr/bin 2> /dev/null; mv usr/games/* usr/bin; rm -rf usr/games
+	migrate_directory usr/games usr/bin || exit 1
 fi
 if [[ -e bin ]]; then
-	mkdir -p usr/bin 2> /dev/null; mv bin/* usr/bin; rm -rf bin
+	migrate_directory bin usr/bin || exit 1
 fi
 if [[ -e sbin ]]; then
-	mkdir -p usr/bin 2> /dev/null; mv sbin/* usr/bin; rm -rf sbin
+	migrate_directory sbin usr/bin || exit 1
 fi
 if [[ -e usr/sbin ]]; then
-	mkdir usr/bin 2> /dev/null; mv usr/sbin/* usr/bin; rm -rf usr/sbin
+	migrate_directory usr/sbin usr/bin || exit 1
 fi
 if [[ -e usr/local/games ]]; then
-	mkdir usr/bin 2> /dev/null; mv usr/local/games/* usr/bin; rm -rf usr/local/games
+	migrate_directory usr/local/games usr/bin || exit 1
 fi
 if [[ -e usr/local/bin ]]; then
-	mkdir usr/bin 2> /dev/null; mv usr/local/bin/* usr/bin; rm -rf usr/local/bin
+	migrate_directory usr/local/bin usr/bin || exit 1
 fi
 if [[ -e usr/local/sbin ]]; then
-	mkdir usr/bin 2> /dev/null; mv usr/local/sbin/* usr/bin; rm -rf usr/local/sbin
+	migrate_directory usr/local/sbin usr/bin || exit 1
 fi
 if [[ -e usr/share/applications ]]; then
 	ls usr/share/applications/*.desktop | while read line; do
@@ -350,42 +417,42 @@ if [[ -e usr/share/applications ]]; then
 fi
 if [[ $pseudo != set ]]; then
 	if [[ -e lib ]]; then
-		mkdir -p usr/lib 2> /dev/null; mv lib/* usr/lib; rm -rf lib
+		migrate_directory lib usr/lib || exit 1
 	fi
 	if [[ -e lib32 ]]; then
 		if [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-			mkdir -p usr/lib 2> /dev/null; mv lib32/* usr/lib; rm -rf lib32
+			migrate_directory lib32 usr/lib || exit 1
 		else
-			mkdir -p usr/lib32 2> /dev/null; mv lib32/* usr/lib32; rm -rf lib32
+			migrate_directory lib32 usr/lib32 || exit 1
 		fi
 	fi
 	if [[ -e lib64 ]]; then
-		mkdir -p usr/lib 2> /dev/null; mv lib64/* usr/lib; rm -rf lib64
+		migrate_directory lib64 usr/lib || exit 1
 	fi
 	if [[ -e usr/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-		mkdir usr/lib 2> /dev/null; mv usr/lib32/* usr/lib; rm -rf usr/lib32
+		migrate_directory usr/lib32 usr/lib || exit 1
 	fi
 	if [[ -e usr/lib64 ]]; then
-		mkdir usr/lib 2> /dev/null; mv usr/lib64/* usr/lib; rm -rf usr/lib64
+		migrate_directory usr/lib64 usr/lib || exit 1
 	fi
 	if [[ -e usr/local/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-		mkdir usr/local/lib 2> /dev/null; mv usr/local/lib32/* usr/local/lib; rm -rf usr/local/lib32
+		migrate_directory usr/local/lib32 usr/local/lib || exit 1
 	fi
 	if [[ -e usr/local/lib64 ]]; then
-		mkdir usr/local/lib 2> /dev/null; mv usr/local/lib64/* usr/local/lib; rm -rf usr/local/lib64
+		migrate_directory usr/local/lib64 usr/local/lib || exit 1
 	fi
 else
 	if [[ -e lib ]]; then
-		mkdir -p usr/lib32 2> /dev/null; mv lib/* usr/lib32; rm -rf lib
+		migrate_directory lib usr/lib32 || exit 1
 	fi
 	if [[ -e lib32 ]]; then
-		mkdir -p usr/lib32 2> /dev/null; mv lib32/* usr/lib32; rm -rf lib32
+		migrate_directory lib32 usr/lib32 || exit 1
 	fi
 	if [[ -e usr/lib ]]; then
-		mkdir usr/lib32 2> /dev/null; mv usr/lib/* usr/lib32; rm -rf usr/lib
+		migrate_directory usr/lib usr/lib32 || exit 1
 	fi
 	if [[ -e usr/local/lib ]]; then
-		mkdir usr/local/lib32 2> /dev/null; mv usr/local/lib/* usr/local/lib32; rm -rf usr/local/lib
+		migrate_directory usr/local/lib usr/local/lib32 || exit 1
 	fi
 fi
 
@@ -3021,7 +3088,7 @@ mv *missing-files /tmp/debtap 2> /dev/null
 # Report of (warning messages for) untranslated packages names and packages with missing files (if any exist)
 if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]]; then
     echo -e "\n${lightred}Warning: These dependencies (depend =   fields) could not be translated into Arch Linux packages names:${NC}"
-    echo $($(cat /tmp/debtap/dependencies-untranslated-names-only)) | sed s'/ /, /g'
+    print_package_report /tmp/debtap/dependencies-untranslated-names-only
 fi
 if [[ -e /tmp/debtap/dependencies-missing-files ]]; then
     if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]]; then
@@ -3037,7 +3104,7 @@ if [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]
     else
 	echo -e "\n${lightred}Warning: These optional dependencies (optdepend =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    echo $($(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1)) | sed s'/ /, /g'
+    print_package_report /tmp/debtap/optional-dependencies-untranslated-names-only-1
 fi
 if [[ $(cat /tmp/debtap/replacements-untranslated-names-only) != "" ]]; then
     if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]] || [[ -e /tmp/debtap/dependencies-missing-files ]] || [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]]; then
@@ -3045,7 +3112,7 @@ if [[ $(cat /tmp/debtap/replacements-untranslated-names-only) != "" ]]; then
     else
 	echo -e "\n${lightred}Warning: These replacements (replaces =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    echo $($(cat /tmp/debtap/replacements-untranslated-names-only)) | sed s'/ /, /g'
+    print_package_report /tmp/debtap/replacements-untranslated-names-only
 fi
 if [[ $(cat /tmp/debtap/conflicts-untranslated-names-only) != "" ]]; then
     if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]] || [[ -e /tmp/debtap/dependencies-missing-files ]] || [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]] || [[ $(cat /tmp/debtap/replacements-untranslated-names-only) != "" ]]; then
@@ -3053,7 +3120,7 @@ if [[ $(cat /tmp/debtap/conflicts-untranslated-names-only) != "" ]]; then
     else
 	echo -e "\n${lightred}Warning: These conflicts (conflict =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    echo $($(cat /tmp/debtap/conflicts-untranslated-names-only)) | sed s'/ /, /g'
+    print_package_report /tmp/debtap/conflicts-untranslated-names-only
 fi
 if [[ $(cat /tmp/debtap/provisions-untranslated-names-only) != "" ]]; then
     if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]] || [[ -e /tmp/debtap/dependencies-missing-files ]] || [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]] || [[ $(cat /tmp/debtap/replacements-untranslated-names-only) != "" ]] || [[ $(cat /tmp/debtap/conflicts-untranslated-names-only) != "" ]]; then
@@ -3061,7 +3128,7 @@ if [[ $(cat /tmp/debtap/provisions-untranslated-names-only) != "" ]]; then
     else
 	echo -e "\n${lightred}Warning: These provisions (provides =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    echo $($(cat /tmp/debtap/provisions-untranslated-names-only)) | sed s'/ /, /g'
+    print_package_report /tmp/debtap/provisions-untranslated-names-only
 fi
 
 # Generating .INSTALL file (if necessary)
@@ -3292,97 +3359,63 @@ fi
 # Generating PKGBUILD file
 echo -e "\n${lightgreen}==>${NC} ${bold}Generating PKGBUILD file...${normal}"
 echo "# Generated by debtap" > PKGBUILD
-if [[ $quiet == set  ]] || [[ $Quiet == set ]]; then
-	echo "# Maintainer: " >> PKGBUILD
-	echo "# Contributor: " >> PKGBUILD
+if [[ $quiet == set ]] || [[ $Quiet == set ]]; then
+	printf '# Maintainer: \n# Contributor: \n' >> PKGBUILD
 else
-	echo "# Maintainer: $(grep '^packager =' .PKGINFO | gawk '{print $3}')" >> PKGBUILD
-	echo "# Contributor: $(grep '^packager =' .PKGINFO | gawk '{print $3}')" >> PKGBUILD
+	# Prefix every line so even edited multiline metadata remains a comment.
+	pkginfo_values packager | sed 's/^/# Maintainer: /' >> PKGBUILD
+	pkginfo_values packager | sed 's/^/# Contributor: /' >> PKGBUILD
 fi
-if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(ls -A usr/bin 2> /dev/null) ]]; then
-	echo "$(grep '^pkgname =' .PKGINFO | sed s'/ //g')-bin" >> PKGBUILD
-else
-	echo "$(grep '^pkgname =' .PKGINFO | sed s'/ //g')" >> PKGBUILD
-fi
-echo "$(grep '^pkgver =' .PKGINFO | sed -e s'/ //g' -e s'/-/ /g' | gawk '{print $1}')" >> PKGBUILD
-echo "pkgrel=$(grep '^pkgver =' .PKGINFO | sed -e s'/ //g' -e s'/-/ /g' | gawk '{print $2}')" >> PKGBUILD
-echo "$(grep '^pkgdesc =' .PKGINFO | sed s'/ = /="/')\"" >> PKGBUILD
-if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]]; then
-	if [[ $(grep -q '^arch = i686$' .PKGINFO; echo $?) == 0 ]] || [[ $(grep -q '^arch = x86_64$' .PKGINFO; echo $?) == 0 ]]; then
-		echo "arch=('i686' 'x86_64')" >> PKGBUILD
-	elif [[ $(grep -q '^arch = armv7l$' .PKGINFO; echo $?) == 0 ]]; then
-		echo "arch=('armv7l')" >> PKGBUILD
-	elif [[ $(grep -q '^arch = aarch64$' .PKGINFO; echo $?) == 0 ]]; then
-		echo "arch=('aarch64')" >> PKGBUILD
-	elif [[ $(grep -q '^arch = any$' .PKGINFO; echo $?) == 0 ]]; then
-		echo "arch=('any')" >> PKGBUILD
+pkgname=$(pkginfo_values pkgname)
+pkgbuild_arch=$(pkginfo_values arch)
+pkgbuild_dual_arch=
+if [[ $pkgname != lib32-* && $pkgname != *-multilib ]]; then
+	if [[ $(ls -A usr/bin 2> /dev/null) ]]; then pkgname+=-bin; fi
+	if [[ $pkgbuild_arch == i686 || $pkgbuild_arch == x86_64 ]]; then
+		pkgbuild_dual_arch=set
 	fi
 else
-	echo "arch=('x86_64')" >> PKGBUILD
+	pkgbuild_arch=x86_64
 fi
-echo "$(grep '^url =' .PKGINFO | sed s'/ //g' | sed s'/=/="/')\"" >> PKGBUILD
-echo "license=('$(echo $(grep '^license =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-echo "groups=('')" >> PKGBUILD
-if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(grep -q '^depend =' .PKGINFO; echo $?) == 0 ]]; then
-	if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(echo $(grep '^depend =' .PKGINFO | gawk '{print $3}')) != $(echo $(grep '^depend =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g')) ]]; then
-		if [[ $(grep -q '^arch = i686$' .PKGINFO; echo $?) == 0 ]] || [[ $(grep -q '^arch = x86_64$' .PKGINFO; echo $?) == 0 ]]; then
-			echo "depends_i686=('$(echo $(grep '^depend =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g') | sed s"/ /' '/g")')" >> PKGBUILD
-			echo "depends_x86_64=('$(echo $(grep '^depend =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
+write_pkgbuild_scalar pkgname "$pkgname"
+pkgbuild_version=$(pkginfo_values pkgver)
+write_pkgbuild_scalar pkgver "${pkgbuild_version%-*}"
+write_pkgbuild_scalar pkgrel "${pkgbuild_version##*-}"
+write_pkgbuild_scalar pkgdesc "$(pkginfo_values pkgdesc)"
+if [[ $pkgbuild_dual_arch == set ]]; then
+	write_pkgbuild_array arch i686 x86_64
+else
+	write_pkgbuild_array arch "$pkgbuild_arch"
+fi
+write_pkgbuild_scalar url "$(pkginfo_values url)"
+mapfile -t pkgbuild_values < <(pkginfo_values license)
+write_pkgbuild_array license "${pkgbuild_values[@]}"
+write_pkgbuild_array groups
+for field in depend optdepend provides conflicts replaces backup; do
+	mapfile -t pkgbuild_values < <(pkginfo_values "$field")
+	[[ ${#pkgbuild_values[@]} == 0 ]] && continue
+	case $field in
+		depend) array_name=depends ;;
+		optdepend) array_name=optdepends ;;
+		*) array_name=$field ;;
+	esac
+	pkgbuild_i686_values=()
+	for value in "${pkgbuild_values[@]}"; do
+		if [[ $field == backup ]]; then
+			value=${value/#usr\/lib32\//usr\/lib\/}
+		else
+			value=${value#lib32-}
+			value=${value%-multilib}
 		fi
+		pkgbuild_i686_values+=("$value")
+	done
+	if [[ $pkgbuild_dual_arch == set && "${pkgbuild_values[*]}" != "${pkgbuild_i686_values[*]}" ]]; then
+		write_pkgbuild_array "${array_name}_i686" "${pkgbuild_i686_values[@]}"
+		write_pkgbuild_array "${array_name}_x86_64" "${pkgbuild_values[@]}"
 	else
-		echo "depends=('$(echo $(grep '^depend =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
+		write_pkgbuild_array "$array_name" "${pkgbuild_values[@]}"
 	fi
-fi
-if [[ $(grep -q '^optdepend =' .PKGINFO; echo $?) == 0 ]]; then
-	if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(echo $(grep '^optdepend =' .PKGINFO | gawk '{print $3}')) != $(echo $(grep '^optdepend =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g')) ]]; then
-		if [[ $(grep -q '^arch = i686$' .PKGINFO; echo $?) == 0 ]] || [[ $(grep -q '^arch = x86_64$' .PKGINFO; echo $?) == 0 ]]; then
-			for i in $(grep '^optdepend =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g'); do echo "                 '$i'"; done | sed -e "1 s/^                 /optdepends_i686=(/" -e "$ s/'$/')/" >> PKGBUILD
-			for i in $(grep '^optdepend =' .PKGINFO | gawk '{print $3}'); do echo "                   '$i'"; done | sed -e "1 s/^                   /optdepends_x86_64=(/" -e "$ s/'$/')/" >> PKGBUILD
-		fi
-	else
-		for i in $(grep '^optdepend =' .PKGINFO | gawk '{print $3}'); do echo "            '$i'"; done | sed -e "1 s/^            /optdepends=(/" -e "$ s/'$/')/" >> PKGBUILD
-	fi
-fi
-if [[ $(grep -q '^provides =' .PKGINFO; echo $?) == 0 ]]; then
-	if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(echo $(grep '^provides =' .PKGINFO | gawk '{print $3}')) != $(echo $(grep '^provides =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g')) ]]; then
-		if [[ $(grep -q '^arch = i686$' .PKGINFO; echo $?) == 0 ]] || [[ $(grep -q '^arch = x86_64$' .PKGINFO; echo $?) == 0 ]]; then
-			echo "provides_i686=('$(echo $(grep '^provides =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g') | sed s"/ /' '/g")')" >> PKGBUILD
-			echo "provides_x86_64=('$(echo $(grep '^provides =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-		fi
-	else
-		echo "provides=('$(echo $(grep '^provides =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-	fi
-fi
-if [[ $(grep -q '^conflicts =' .PKGINFO; echo $?) == 0 ]]; then
-	if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(echo $(grep '^conflicts =' .PKGINFO | gawk '{print $3}')) != $(echo $(grep '^conflicts =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g')) ]]; then
-		if [[ $(grep -q '^arch = i686$' .PKGINFO; echo $?) == 0 ]] || [[ $(grep -q '^arch = x86_64$' .PKGINFO; echo $?) == 0 ]]; then
-			echo "conflicts_i686=('$(echo $(grep '^conflicts =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g') | sed s"/ /' '/g")')" >> PKGBUILD
-			echo "conflicts_x86_64=('$(echo $(grep '^conflicts =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-		fi
-	else
-		echo "conflicts=('$(echo $(grep '^conflicts =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-	fi
-fi
-if [[ $(grep -q '^replaces =' .PKGINFO; echo $?) == 0 ]]; then
-	if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(echo $(grep '^replaces =' .PKGINFO | gawk '{print $3}')) != $(echo $(grep '^replaces =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g')) ]]; then
-		if [[ $(grep -q '^arch = i686$' .PKGINFO; echo $?) == 0 ]] || [[ $(grep -q '^arch = x86_64$' .PKGINFO; echo $?) == 0 ]]; then
-			echo "replaces_i686=('$(echo $(grep '^replaces =' .PKGINFO | gawk '{print $3}' | sed s'/^lib32-\|-multilib$//g') | sed s"/ /' '/g")')" >> PKGBUILD
-			echo "replaces_x86_64=('$(echo $(grep '^replaces =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-		fi
-	else
-		echo "replaces=('$(echo $(grep '^replaces =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-	fi
-fi
-if [[ $(grep -q '^backup =' .PKGINFO; echo $?) == 0 ]]; then
-	if [[ $(grep -q '^pkgname = lib32-' .PKGINFO; echo $?) != 0 ]] && [[ $(grep '^pkgname =' .PKGINFO | grep -q -- '-multilib$'; echo $?) != 0 ]] && [[ $(echo $(grep '^backup =' .PKGINFO | gawk '{print $3}')) != $(echo $(grep '^backup =' .PKGINFO | gawk '{print $3}' | sed s'/^usr\/lib32\//usr\/lib\//g')) ]]; then
-		if [[ $(grep -q '^arch = i686$' .PKGINFO; echo $?) == 0 ]] || [[ $(grep -q '^arch = x86_64$' .PKGINFO; echo $?) == 0 ]]; then
-			echo "backup_i686=('$(echo $(grep '^backup =' .PKGINFO | gawk '{print $3}' | sed s'/^usr\/lib32\//usr\/lib\//g') | sed s"/ /' '/g")')" >> PKGBUILD
-			echo "backup_x86_64=('$(echo $(grep '^backup =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-		fi
-	else
-		echo "backup=('$(echo $(grep '^backup =' .PKGINFO | gawk '{print $3}') | sed s"/ /' '/g")')" >> PKGBUILD
-	fi
-fi
+done
 echo "options=('!strip' '!emptydirs')" >> PKGBUILD
 if [[ -e .INSTALL ]]; then
 	echo 'install=${pkgname}.install' >> PKGBUILD
@@ -3410,8 +3443,9 @@ if [[ $pseudo != set ]]; then
 else
 	echo "sha512sums=('$(sha512sum "$package_with_full_path" | gawk '{print $1}')')" >> PKGBUILD
 fi
+declare -f migrate_directory >> PKGBUILD
 echo -e "\npackage(){\n\n	# Extract package data" >> PKGBUILD
-echo "	$data_extract -f $data_tar_check -C \"\${pkgdir}\"" >> PKGBUILD
+printf '\t%s -f %q -C "${pkgdir}" || return 1\n' "$data_extract" "$data_tar_check" >> PKGBUILD
 if [[ -e pkgbuildinstallations1 ]] || [[ -e pkgbuildinstallations2 ]] || [[ -e pkgbuildinstallations32 ]] || [[ -e pkgbuildinstallations64 ]]; then
 	if [[ $(grep '^install' pkgbuildinstallations1 2> /dev/null | wc -l) != $(($(cat pkgbuildinstallations1 2> /dev/null | wc -l) + $(cat pkgbuildinstallations2 2> /dev/null | wc -l) + $(cat pkgbuildinstallations32 2> /dev/null | wc -l) + $(cat pkgbuildinstallations64 2> /dev/null | wc -l))) ]]; then
 		echo -e "\n	# Fix directory structure differences\n	cd \"\${pkgdir}\"" >> PKGBUILD
@@ -3420,10 +3454,10 @@ fi
 if [[ -e pkgbuildinstallations1 ]]; then
 	echo >> PKGBUILD
 	cat pkgbuildinstallations1 | while read -r line; do
-		echo -e "	$line" >> PKGBUILD
+		printf '\t%s\n' "$line" >> PKGBUILD
 	done
 fi
-if [[ $(grep -q "^arch=('i686' 'x86_64')$" PKGBUILD; echo $?) == 0 ]]; then
+if [[ $pkgbuild_dual_arch == set ]]; then
 	if [[ -e pkgbuildinstallations32 ]] && [[ -e pkgbuildinstallations64 ]]; then
 		echo -e "\n	if [[ \${CARCH} == i686 ]]; then" >> PKGBUILD
 		cat pkgbuildinstallations32 | while read -r line; do
@@ -3447,16 +3481,16 @@ if [[ $(grep -q "^arch=('i686' 'x86_64')$" PKGBUILD; echo $?) == 0 ]]; then
 		done
 		echo "	fi" >> PKGBUILD
 	fi
-elif [[ $(grep -q "^arch=('x86_64')$" PKGBUILD; echo $?) == 0 ]] && [[ -e pkgbuildinstallations64 ]]; then
+elif [[ $pkgbuild_arch == x86_64 ]] && [[ -e pkgbuildinstallations64 ]]; then
 	echo >> PKGBUILD
 	cat pkgbuildinstallations64 | while read -r line; do
-		echo -e "	$line" >> PKGBUILD
+		printf '\t%s\n' "$line" >> PKGBUILD
 	done
 fi
 if [[ -e pkgbuildinstallations2 ]]; then
 	echo >> PKGBUILD
 	cat pkgbuildinstallations2 | while read -r line; do
-		echo -e "	$line" >> PKGBUILD
+		printf '\t%s\n' "$line" >> PKGBUILD
 	done
 fi
 if [[ -e pkgbuildinstallations1 ]] || [[ -e pkgbuildinstallations2 ]] || [[ -e pkgbuildinstallations32 ]] || [[ -e pkgbuildinstallations64 ]]; then
@@ -3467,13 +3501,11 @@ fi
 echo -e "\n}" >> PKGBUILD
 echo "$output_directory"
 # Moving PKGBUILD (and .INSTALL, if it exists) and announcing its creation
-pkgname="$(grep '^pkgname=' PKGBUILD | sed s'/^pkgname=//')"
 if [[ $output == set ]]; then
 	pkgbuild_location="$outputdirectory/$pkgname-PKGBUILD"
-	rm -rf "$pkgbuild_location" 2> /dev/null
-	mkdir "$pkgbuild_location" 2> /dev/null
-	if [[ $? != 0 ]]; then
-		echo -e "${red}Error: Cannot create PKGBUILD directory to output directory, permission denied. Removing leftover files and exiting...${NC}"
+	# mkdir refuses existing directories and symlinks, preserving earlier edits.
+	if ! mkdir -- "$pkgbuild_location"; then
+		echo -e "${red}Error: Cannot create PKGBUILD directory in output directory (already exists or permission denied). Removing leftover files and exiting...${NC}"
 		rm -rf "$working_directory"
 		rm -rf /tmp/debtap
 		exit 1
@@ -3487,10 +3519,9 @@ if [[ $output == set ]]; then
 	fi
 else
 	pkgbuild_location=""$(dirname "$package_with_full_path")"/$pkgname-PKGBUILD"
-	rm -rf "$pkgbuild_location" 2> /dev/null
-	mkdir "$pkgbuild_location" 2> /dev/null
-	if [[ $? != 0 ]]; then
-		echo -e "${red}Error: Cannot create PKGBUILD directory to the same directory as .deb package, permission denied. Removing leftover files and exiting...${NC}"
+	# mkdir refuses existing directories and symlinks, preserving earlier edits.
+	if ! mkdir -- "$pkgbuild_location"; then
+		echo -e "${red}Error: Cannot create PKGBUILD directory beside .deb package (already exists or permission denied). Removing leftover files and exiting...${NC}"
 		rm -rf "$working_directory"
 		rm -rf /tmp/debtap
 		exit 1

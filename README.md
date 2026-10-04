@@ -35,6 +35,10 @@ A script for converting .deb packages into Arch Linux packages, focused on accur
 
 For example: `debtap world-of-goo-demo_1.0_i386.deb`
 
+When generating a PKGBUILD, debtap preserves an existing `<pkgname>-PKGBUILD`
+directory and exits with an error. Choose another output directory or rename the
+existing directory before generating it again.
+
 Any recommendations or questions for debtap are welcomed!
 
 Available options:
