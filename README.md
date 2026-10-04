@@ -39,6 +39,16 @@ When generating a PKGBUILD, debtap preserves an existing `<pkgname>-PKGBUILD`
 directory and exits with an error. Choose another output directory or rename the
 existing directory before generating it again.
 
+Conversion uses a private temporary directory under `${TMPDIR:-/tmp}` and removes
+it on completion, failure, or interruption. Extracted package contents are kept
+separate from conversion metadata and scratch files.
+
+Existing output packages are preserved too: conversion fails if the destination
+filename already exists. Choose another output directory or rename the existing
+package before converting again. The complete compressed package is published
+using a hard link within the output filesystem, which must support hard links.
+Archive, compression, or publication failures return a nonzero exit status.
+
 Any recommendations or questions for debtap are welcomed!
 
 Available options:
@@ -54,3 +64,13 @@ Available options:
     -P  --Pkgbuild    Generate a PKGBUILD file only
     -o  --output      Output directory for generated package and/or PKGBUILD (optional)
     -v  --version     Print version
+
+Development checks:
+===================
+
+    bash -n debtap
+    python3 -m unittest discover -s tests -v
+
+The regression suite uses temporary package fixtures and mocked repository
+lookups; it needs no root access or network. It requires Python 3 and the local
+conversion tools, including GNU tar, bsdtar, fakeroot, zstd, ar, and gawk.

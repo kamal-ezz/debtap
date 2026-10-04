@@ -6,9 +6,11 @@ import gzip
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'debtap'
@@ -33,11 +35,15 @@ class DebtapRegressionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='conversion-tests-')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.env = dict(os.environ, TERM='dumb')
+        self.work_temp = self.root / 'temporary work [literal]'
+        self.work_temp.mkdir()
+        self.env = dict(os.environ, TERM='dumb', TMPDIR=str(self.work_temp))
+        self.addCleanup(lambda: self.assertEqual(list(self.work_temp.iterdir()), []))
 
-    def bash(self, code, args=()):
+    def bash(self, code, args=(), input=None):
         return subprocess.run(['bash', '-c', code, 'test', *map(str, args)], cwd=self.root,
-                              env=self.env, text=True, capture_output=True, timeout=30)
+                              env=self.env, text=True, capture_output=True, timeout=30,
+                              input=input)
 
     def assert_ok(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -48,12 +54,16 @@ class DebtapRegressionTests(unittest.TestCase):
         path.write_text(value)
         return path
 
-    def make_deb(self, corrupt=None):
+    def make_deb(self, corrupt=None, control=None, payload=None):
         self.write('debian-binary', '2.0\n')
-        archive(self.root / 'control.tar.gz', {'control':
-            'Package: demoapp\nVersion: 1.0\nArchitecture: all\nDescription: Sample package\n'})
-        archive(self.root / 'data.tar.gz', {'lib/.hidden': 'hidden',
-            'lib/shared/a': 'first', 'usr/lib/shared/b': 'second'})
+        if control is None:
+            control = {'control': 'Package: demoapp\nVersion: 1.0\nArchitecture: all\n'
+                       'Description: Sample package\n'}
+        if payload is None:
+            payload = {'lib/.hidden': 'hidden', 'lib/shared/a': 'first',
+                       'usr/lib/shared/b': 'second'}
+        archive(self.root / 'control.tar.gz', control)
+        archive(self.root / 'data.tar.gz', payload)
         if corrupt:
             self.write(corrupt, 'broken archive')
         result = subprocess.run(['ar', 'rc', 'demo.deb', 'debian-binary', 'control.tar.gz',
@@ -117,10 +127,9 @@ extract_deb_member data.tar.gz 'tar -xz'
         self.assertTrue((self.root / 'lib/.hidden').exists())
 
     def conversion_script(self):
-        # Redirect all hardcoded cache/report paths in a temporary script copy.
+        # Redirect hardcoded caches; conversion workspaces use our TMPDIR.
         source = SOURCE.replace('/var/cache/debtap', str(self.root / 'cache'))
         source = source.replace('/var/cache/pkgfile', str(self.root / 'pkgfile-cache'))
-        source = source.replace('/tmp/debtap', str(self.root / 'reports'))
         for name in CACHE_NAMES:
             self.write('cache/' + name, 'fixture\n')
         self.write('pkgfile-cache/core.files.123', 'fixture\n')
@@ -128,6 +137,203 @@ extract_deb_member data.tar.gz 'tar -xz'
         mock.chmod(0o755)
         self.env['PATH'] = str(mock.parent) + os.pathsep + self.env['PATH']
         return self.write('isolated-debtap', source)
+
+    def mock_command(self, name, code):
+        mock = self.write('commands/' + name, '#!/bin/bash\n' + code)
+        mock.chmod(0o755)
+
+    def package_contents(self, directory=None):
+        packages = list((directory or self.root).glob('*.pkg.tar.zst'))
+        self.assertEqual(len(packages), 1)
+        result = subprocess.run(['zstd', '-dc', str(packages[0])], capture_output=True,
+                                timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return tarfile.open(fileobj=io.BytesIO(result.stdout))
+
+    def test_existing_working_directory_is_preserved(self):
+        script = self.conversion_script()
+        deb = self.make_deb()
+        marker = self.write('demo-working-directory/user-work', 'preserve me')
+        self.assert_ok(self.bash('bash "$1" -Q "$2"', [script, deb]))
+        self.assertEqual(marker.read_text(), 'preserve me')
+
+    def test_payload_names_cannot_collide_with_scratch_or_control_files(self):
+        script = self.conversion_script()
+        payload = {name: 'payload: ' + name for name in (
+            'tempfile-important', 'control', 'preinst', 'postinst', 'conffiles',
+            'pkgbuildinstallations1', 'namcap-checks', 'test.pkg.tar', 'data.tar',
+            '.hidden', 'file with spaces', 'line\nbreak', '--checkpoint=1',
+            'usr/share/demo')}
+        deb = self.make_deb(payload=payload)
+        self.assert_ok(self.bash('bash "$1" -Q -p "$2"', [script, deb]))
+        with self.package_contents() as tar:
+            files = {item.name: tar.extractfile(item).read()
+                     for item in tar if item.isfile()}
+            for name, content in payload.items():
+                self.assertEqual(files[name], content.encode())
+            self.assertEqual(set(files), set(payload) | {'.PKGINFO', '.MTREE'})
+            self.assertTrue(all(item.uid == 0 and item.gid == 0 for item in tar))
+            mtree = gzip.decompress(files['.MTREE'])
+            self.assertIn(b'tempfile-important', mtree)
+            self.assertIn(b'.hidden', mtree)
+        pkgbuild = self.root / 'demoapp-PKGBUILD/PKGBUILD'
+        pkgdir = self.root / 'pkgdir'
+        pkgdir.mkdir()
+        self.assert_ok(self.bash('source "$1"; pkgdir=$2; package', [pkgbuild, pkgdir]))
+        for name, content in payload.items():
+            self.assertEqual((pkgdir / name).read_text(), content)
+
+    def test_invalid_identity_is_rejected_without_execution(self):
+        script = self.conversion_script()
+        marker = self.root / 'executed'
+        for field in ('Package', 'Version', 'Architecture'):
+            with self.subTest(field=field):
+                fields = {'Package': 'demoapp', 'Version': '1.0', 'Architecture': 'all'}
+                fields[field] = f'demo$(echo>{marker})'
+                deb = self.make_deb(control={'control': ''.join(
+                    f'{key}: {value}\n' for key, value in fields.items())})
+                result = self.bash('bash "$1" -Q "$2"', [script, deb])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Invalid package', result.stderr)
+                self.assertFalse(marker.exists())
+                self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [])
+
+    def test_edited_identity_is_revalidated(self):
+        script = self.conversion_script()
+        deb = self.make_deb()
+        marker = self.root / 'executed'
+        self.env['EDITOR'] = 'edit-metadata'
+        self.mock_command('edit-metadata',
+                          f"printf '%s\\n' 'pkgname = demo$(echo>{marker})' "
+                          "'pkgver = 1.0-1' 'arch = any' > \"$1\"\n")
+        result = self.bash('bash "$1" -q "$2"', [script, deb], input='3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Invalid package', result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_packaging_failures_never_publish_success(self):
+        script = self.conversion_script()
+        deb = self.make_deb()
+        real_tar = shutil.which('tar')
+        for stage, command, code, error in (
+            ('mtree', 'bsdtar', 'exit 1\n', 'Cannot generate .MTREE'),
+            ('archive', 'tar', f'"{real_tar}" "$@" || exit $?\n'
+             'for arg; do [[ $arg != */package.tar ]] || exit 1; done\nexit 0\n',
+             'Cannot create package archive'),
+            ('compression', 'zstd',
+             'while (( $# )); do if [[ $1 == -o ]]; then shift; '
+             'printf partial > "$1"; break; fi; shift; done\nexit 1\n',
+             'Cannot compress package archive'),
+            ('publication', 'ln', 'exit 1\n', 'Cannot publish package'),
+        ):
+            with self.subTest(stage=stage):
+                self.mock_command(command, code)
+                try:
+                    result = self.bash('bash "$1" -Q "$2"', [script, deb])
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(error, result.stderr)
+                    self.assertNotIn('Package successfully created!', result.stdout)
+                    self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [])
+                    self.assertEqual(list(self.root.glob('.debtap-output.*')), [])
+                    self.assertEqual(list(self.work_temp.iterdir()), [])
+                finally:
+                    (self.root / 'commands' / command).unlink()
+
+    def test_existing_package_and_symlink_are_preserved(self):
+        script = self.conversion_script()
+        deb = self.make_deb()
+        destination = self.write('demoapp-1.0-1-any.pkg.tar.zst', 'original package')
+        result = self.bash('bash "$1" -Q "$2"', [script, deb])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Cannot publish package', result.stderr)
+        self.assertEqual(destination.read_text(), 'original package')
+        destination.unlink()
+        target = self.write('original', 'preserve me')
+        destination.symlink_to(target)
+        result = self.bash('bash "$1" -Q "$2"', [script, deb])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Cannot publish package', result.stderr)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(target.read_text(), 'preserve me')
+        self.assertEqual(list(self.root.glob('.debtap-output.*')), [])
+
+    def test_empty_payload_can_be_packaged(self):
+        script = self.conversion_script()
+        deb = self.make_deb(payload={})
+        self.assert_ok(self.bash('bash "$1" -Q "$2"', [script, deb]))
+        with self.package_contents() as tar:
+            self.assertEqual(set(tar.getnames()), {'.PKGINFO', '.MTREE'})
+
+    def test_maintainer_script_is_packaged_separately_from_payload(self):
+        script = self.conversion_script()
+        deb = self.make_deb(control={
+            'control': 'Package: demoapp\nVersion: 1.0\nArchitecture: all\n'
+                       'Description: Sample package\n',
+            'postinst': '#!/bin/sh\necho installed\n',
+        }, payload={'postinst': 'payload postinst', 'usr/share/demo': 'demo'})
+        self.assert_ok(self.bash('bash "$1" -Q -p "$2"', [script, deb]))
+        with self.package_contents() as tar:
+            self.assertEqual(tar.extractfile('postinst').read(), b'payload postinst')
+            install = tar.extractfile('.INSTALL').read()
+            self.assertIn(b'echo installed', install)
+            self.assertNotIn(b'payload postinst', install)
+            mtree = gzip.decompress(tar.extractfile('.MTREE').read())
+            self.assertIn(b'.INSTALL', mtree)
+        self.assertEqual((self.root / 'demoapp-PKGBUILD/demoapp.install').read_bytes(),
+                         install)
+
+    def test_reserved_payload_metadata_is_rejected(self):
+        script = self.conversion_script()
+        for name in ('.PKGINFO', '.INSTALL', '.MTREE'):
+            with self.subTest(name=name):
+                deb = self.make_deb(payload={name: 'payload'})
+                result = self.bash('bash "$1" -Q "$2"', [script, deb])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('reserved package metadata', result.stderr)
+
+    def test_termination_cleans_workspace(self):
+        script = self.conversion_script()
+        deb = self.make_deb()
+        self.mock_command('namcap', 'kill -TERM "$PPID"\n')
+        result = self.bash('exec bash "$1" -Q "$2"', [script, deb])
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [])
+
+    def test_concurrent_conversions_have_independent_workspaces(self):
+        script = self.conversion_script()
+        deb = self.make_deb()
+        self.env['TEST_GATE'] = str(self.root / 'gate')
+        self.mock_command('namcap', 'printf "%s\\n" "$PWD" > "$TEST_GATE.$PPID"\n'
+                          'for ((i=0; i<500; i++)); do\n'
+                          '  [[ ! -f $TEST_GATE ]] || exit 0\n'
+                          '  sleep 0.01\ndone\nexit 1\n')
+        processes = []
+        try:
+            for name in ('one', 'two'):
+                output = self.root / name
+                output.mkdir()
+                processes.append(subprocess.Popen(
+                    ['bash', str(script), '-Q', '-o', str(output), str(deb)],
+                    cwd=self.root, env=self.env, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            deadline = time.monotonic() + 10
+            while len(list(self.root.glob('gate.*'))) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            gates = list(self.root.glob('gate.*'))
+            self.assertEqual(len(gates), 2)
+            self.assertEqual(len({path.read_text() for path in gates}), 2)
+            self.write('gate', 'continue')
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+            for name in ('one', 'two'):
+                with self.package_contents(self.root / name) as tar:
+                    self.assertEqual(tar.extractfile('usr/lib/.hidden').read(), b'hidden')
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate(timeout=15)
 
     def test_corrupt_archives_stop_conversion(self):
         script = self.conversion_script()

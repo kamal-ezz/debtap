@@ -140,6 +140,53 @@ update_database() (
 	done
 )
 
+# Metadata used in filenames must remain a single, safe value, even after editing.
+validate_package_identity() {
+	local name=$1 version=$2 architecture=$3
+	if [[ ! $name =~ ^[a-z0-9][a-z0-9@._+-]*$ ||
+	      ! $version =~ ^[a-zA-Z0-9][a-zA-Z0-9._+:~-]*$ ||
+	      ! $architecture =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+		printf 'Error: Invalid package name, version, or architecture\n' >&2
+		return 1
+	fi
+}
+
+# Run from scratch; collect only payload entries, including hidden files.
+# The -- separator prevents payload filenames from becoming options.
+write_payload_archive() (
+	local archive=$1 include_mtree=${2:-no}
+	local -a entries payload_args=() metadata=(.PKGINFO)
+	[[ ! -e .INSTALL ]] || metadata+=(.INSTALL)
+	[[ $include_mtree != yes ]] || metadata+=(.MTREE)
+	cd "$payload_directory" || return 1
+	shopt -s dotglob nullglob
+	entries=(*)
+	if (( ${#entries[@]} )); then
+		payload_args=(-C "$payload_directory" -- "${entries[@]}")
+	fi
+	fakeroot tar --force-local --owner=0 --group=0 -pcf "$archive" \
+		-C "$scratch_directory" "${metadata[@]}" "${payload_args[@]}"
+)
+
+write_package_mtree() (
+	local -a entries payload_args=() metadata=(.PKGINFO)
+	[[ ! -e .INSTALL ]] || metadata+=(.INSTALL)
+	cd "$payload_directory" || return 1
+	shopt -s dotglob nullglob
+	entries=(./*)
+	if (( ${#entries[@]} )); then
+		payload_args=(-C "$payload_directory" "${entries[@]}")
+	fi
+	fakeroot bsdtar -czf "$scratch_directory/.MTREE" --format=mtree \
+		--options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' \
+		-C "$scratch_directory" "${metadata[@]}" "${payload_args[@]}"
+)
+
+cleanup_conversion() {
+	[[ -z ${publication_directory:-} ]] || rm -rf -- "$publication_directory"
+	[[ -z ${working_directory:-} ]] || rm -rf -- "$working_directory"
+}
+
 # Options, help, database update and error messages
 optionsarray=("$@")
 for i in "$@"; do
@@ -241,150 +288,162 @@ tar_extract_cmd() {
 	echo "tar -x$flags"
 }
 
-# Defining package with full path & defining and creating working directory
+# Each conversion owns its workspace; payload and scratch files never overlap.
 package_with_full_path="$(readlink -f "${@: -1}")"
-working_directory="$(pwd)/$(basename "${@: -1}" | tr '[:upper:]' '[:lower:]' | sed s'/\.deb$//')-working-directory"
-rm -rf "$working_directory" 2> /dev/null
-mkdir "$working_directory" 2> /dev/null
-if [[ $? != 0 ]]; then
-	echo -e "${red}Error: Cannot create working directory, permission denied. Exiting...${NC}";	exit 1
-fi
-cd "$working_directory"
+temporary_root=$(realpath -- "${TMPDIR:-/tmp}") || exit 1
+working_directory=$(mktemp -d "$temporary_root/debtap.XXXXXXXX") || exit 1
+trap cleanup_conversion EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+control_directory="$working_directory/control"
+payload_directory="$working_directory/payload"
+scratch_directory="$working_directory/scratch"
+report_directory="$working_directory/reports"
+mkdir -- "$control_directory" "$payload_directory" "$scratch_directory" "$report_directory" || exit 1
+cd "$control_directory" || exit 1
 
-# Extracting package data and metadata in working directory (also checking package architecture, if you are running the pseudo option)
 echo -e "${lightgreen}==>${NC} ${bold}Extracting package data...${normal}"
-control_tar_check=$(ar t "$package_with_full_path" | grep -m 1 "control\.tar")
-control_extract=$(tar_extract_cmd "$control_tar_check")
-if [ $? != 0 ]; then
-    rm -rf "$working_directory"
-    exit 1
+control_tar_check=$(ar t "$package_with_full_path" | grep -m 1 '^control\.tar\($\|\.\)')
+control_extract=$(tar_extract_cmd "$control_tar_check") || exit 1
+if ! extract_deb_member "$control_tar_check" "$control_extract" || [[ ! -f control || -L control ]]; then
+	printf 'Error: Cannot extract package metadata\n' >&2
+	exit 1
 fi
-if ! extract_deb_member "$control_tar_check" "$control_extract" || [[ ! -f control ]]; then
-    echo -e "${red}Error: Cannot extract package metadata. Exiting...${NC}" >&2
-    rm -rf "$working_directory"
-    exit 1
+# Only copy recognized regular control files into scratch.
+for metadata_file in control preinst postinst prerm postrm conffiles; do
+	if [[ -e $metadata_file || -L $metadata_file ]]; then
+		if [[ ! -f $metadata_file || -L $metadata_file ]]; then
+			printf 'Error: Invalid control file: %s\n' "$metadata_file" >&2
+			exit 1
+		fi
+		cp -- "$metadata_file" "$scratch_directory/$metadata_file" || exit 1
+	fi
+done
+validate_package_identity \
+	"$(sed -n 's/^Package:[[:blank:]]*//Ip' control)" \
+	"$(sed -n 's/^Version:[[:blank:]]*//Ip' control)" \
+	"$(sed -n 's/^Architecture:[[:blank:]]*//Ip' control)" || exit 1
+if [[ $pseudo == set ]] && ! grep -q '^Architecture: *i386$' control; then
+	printf 'Error: Invalid package architecture\n' >&2
+	exit 1
 fi
 
-if [[ $pseudo == set ]] && [[ $(grep ^Architecture: control | grep -q i386; echo $?) != 0 ]]; then
-    echo -e "${red}Error: Invalid package architecture. Removing extracted package data and exiting...${NC}"
-    rm -rf "$working_directory"
-    exit 1
-fi
-
-rm -rf $(ls * | grep -v 'control\|preinst\|postinst\|prerm\|postrm\|conffiles')
-data_tar_check=$(ar t "$package_with_full_path" | grep -m 1 "data\.tar")
-data_extract=$(tar_extract_cmd "$data_tar_check")
-if [ $? != 0 ]; then
-    rm -rf "$working_directory"
-    exit 1
-fi
+cd "$payload_directory" || exit 1
+data_tar_check=$(ar t "$package_with_full_path" | grep -m 1 '^data\.tar\($\|\.\)')
+data_extract=$(tar_extract_cmd "$data_tar_check") || exit 1
 if ! extract_deb_member "$data_tar_check" "$data_extract"; then
-    echo -e "${red}Error: Cannot extract package data. Exiting...${NC}" >&2
-    rm -rf "$working_directory"
-    exit 1
+	printf 'Error: Cannot extract package data\n' >&2
+	exit 1
 fi
+for metadata_file in .PKGINFO .INSTALL .MTREE; do
+	if [[ -e $metadata_file || -L $metadata_file ]]; then
+		printf 'Error: Payload contains reserved package metadata: %s\n' "$metadata_file" >&2
+		exit 1
+	fi
+done
 
 # Fixing possible differences in filesystem hierarchy of the extracted package data, so that it matches Arch Linux filesystem hierarchy
 echo -e "${lightgreen}==>${NC} ${bold}Fixing possible directories structure differencies...${normal}"
 if [[ $pkgbuild == set ]] || [[ $Pkgbuild == set ]]; then
 	if [[ $(find ./ -iname '*license*' | wc -l) != 0 ]]; then
-		printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*license*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
+		printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*license*' | sort | tail -1 | sed s'/^\.\///')" >> "$scratch_directory/pkgbuildinstallations1"
 	fi
 	if [[ $(find ./ -iname '*copyright*' | wc -l) != 0 ]]; then
 		if [[ $(find ./ -iname '*license*' | wc -l) != 0 ]]; then
-			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/COPYRIGHT" || return 1\n' "$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/COPYRIGHT" || return 1\n' "$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')" >> "$scratch_directory/pkgbuildinstallations1"
 		else
-			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*copyright*' | sort | tail -1 | sed s'/^\.\///')" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ $(find ./ -iname '*eula*' | wc -l) != 0 ]]; then
 		if [[ $(find ./ -iname '*license*' | wc -l) != 0 ]] || [[ $(find ./ -iname '*copyright*' | wc -l) != 0 ]]; then
-			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/EULA" || return 1\n' "$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/EULA" || return 1\n' "$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')" >> "$scratch_directory/pkgbuildinstallations1"
 		else
-			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')" >> pkgbuildinstallations1
+			printf 'install -D -m644 %q "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" || return 1\n' "$(find ./ -iname '*eula*' | sort | tail -1 | sed s'/^\.\///')" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ -e usr/games ]]; then
-		echo 'migrate_directory usr/games usr/bin || return 1' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/games usr/bin || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		if [[ -e usr/share/applications ]]; then
-			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/games\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
+			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/games\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ -e bin ]]; then
-		echo 'migrate_directory bin usr/bin || return 1' >> pkgbuildinstallations1
+		echo 'migrate_directory bin usr/bin || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		if [[ -e usr/share/applications ]]; then
-			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/bin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
+			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/bin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ -e sbin ]]; then
-		echo 'migrate_directory sbin usr/bin || return 1' >> pkgbuildinstallations1
+		echo 'migrate_directory sbin usr/bin || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		if [[ -e usr/share/applications ]]; then
-			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
+			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ -e usr/sbin ]]; then
-		echo 'migrate_directory usr/sbin usr/bin || return 1' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/sbin usr/bin || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		if [[ -e usr/share/applications ]]; then
-			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
+			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ -e usr/local/games ]]; then
-		echo 'migrate_directory usr/local/games usr/bin || return 1' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/local/games usr/bin || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		if [[ -e usr/share/applications ]]; then
-			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/games\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
+			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/games\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ -e usr/local/bin ]]; then
-		echo 'migrate_directory usr/local/bin usr/bin || return 1' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/local/bin usr/bin || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		if [[ -e usr/share/applications ]]; then
-			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/bin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
+			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/bin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ -e usr/local/sbin ]]; then
-		echo 'migrate_directory usr/local/sbin usr/bin || return 1' >> pkgbuildinstallations1
+		echo 'migrate_directory usr/local/sbin usr/bin || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		if [[ -e usr/share/applications ]]; then
-			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> pkgbuildinstallations1
+			echo -e "ls usr/share/applications/*.desktop | while read line; do\n\tsed -i s'/^Exec=\/usr\/local\/sbin\//Exec=\/usr\/bin\//g' \"\$line\"\ndone" >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 	fi
 	if [[ $pseudo != set ]]; then
 		if [[ -e lib ]]; then
-			echo 'migrate_directory lib usr/lib || return 1' >> pkgbuildinstallations1
+			echo 'migrate_directory lib usr/lib || return 1' >> "$scratch_directory/pkgbuildinstallations1"
 		fi
 		if [[ -e lib32 ]]; then
-			if [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-				echo 'migrate_directory lib32 usr/lib || return 1' >> pkgbuildinstallations32
+			if [[ $(grep -i ^Architecture: "$scratch_directory/control" | grep -q i386; echo $?) == 0 ]]; then
+				echo 'migrate_directory lib32 usr/lib || return 1' >> "$scratch_directory/pkgbuildinstallations32"
 			else
-				echo 'migrate_directory lib32 usr/lib32 || return 1' >> pkgbuildinstallations64
+				echo 'migrate_directory lib32 usr/lib32 || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 			fi
 		fi
 		if [[ -e lib64 ]]; then
-			echo 'migrate_directory lib64 usr/lib || return 1' >> pkgbuildinstallations64
+			echo 'migrate_directory lib64 usr/lib || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 		fi
-		if [[ -e usr/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-			echo 'migrate_directory usr/lib32 usr/lib || return 1' >> pkgbuildinstallations32
+		if [[ -e usr/lib32 ]] && [[ $(grep -i ^Architecture: "$scratch_directory/control" | grep -q i386; echo $?) == 0 ]]; then
+			echo 'migrate_directory usr/lib32 usr/lib || return 1' >> "$scratch_directory/pkgbuildinstallations32"
 		fi
 		if [[ -e usr/lib64 ]]; then
-			echo 'migrate_directory usr/lib64 usr/lib || return 1' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/lib64 usr/lib || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 		fi
-		if [[ -e usr/local/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
-			echo 'migrate_directory usr/local/lib32 usr/local/lib || return 1' >> pkgbuildinstallations32
+		if [[ -e usr/local/lib32 ]] && [[ $(grep -i ^Architecture: "$scratch_directory/control" | grep -q i386; echo $?) == 0 ]]; then
+			echo 'migrate_directory usr/local/lib32 usr/local/lib || return 1' >> "$scratch_directory/pkgbuildinstallations32"
 		fi
 		if [[ -e usr/local/lib64 ]]; then
-			echo 'migrate_directory usr/local/lib64 usr/local/lib || return 1' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/local/lib64 usr/local/lib || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 		fi
 	else
 		if [[ -e lib ]]; then
-			tac pkgbuildinstallations32 2> /dev/null >> pkgbuildinstallations32-1; echo 'migrate_directory lib usr/lib || return 1' >> pkgbuildinstallations32-1; tac pkgbuildinstallations32-1 > pkgbuildinstallations32; rm -rf pkgbuildinstallations32-1
-			echo 'migrate_directory lib usr/lib32 || return 1' >> pkgbuildinstallations64
+			tac "$scratch_directory/pkgbuildinstallations32" 2> /dev/null >> "$scratch_directory/pkgbuildinstallations32-1"; echo 'migrate_directory lib usr/lib || return 1' >> "$scratch_directory/pkgbuildinstallations32-1"; tac "$scratch_directory/pkgbuildinstallations32-1" > "$scratch_directory/pkgbuildinstallations32"; rm -rf "$scratch_directory/pkgbuildinstallations32-1"
+			echo 'migrate_directory lib usr/lib32 || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 		fi
 		if [[ -e lib32 ]]; then
-			echo 'migrate_directory lib32 usr/lib32 || return 1' >> pkgbuildinstallations64
+			echo 'migrate_directory lib32 usr/lib32 || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 		fi
 		if [[ -e usr/lib ]]; then
-			echo 'migrate_directory usr/lib usr/lib32 || return 1' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/lib usr/lib32 || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 		fi
 		if [[ -e usr/local/lib ]]; then
-			echo 'migrate_directory usr/local/lib usr/local/lib32 || return 1' >> pkgbuildinstallations64
+			echo 'migrate_directory usr/local/lib usr/local/lib32 || return 1' >> "$scratch_directory/pkgbuildinstallations64"
 		fi
 	fi
 fi
@@ -420,7 +479,7 @@ if [[ $pseudo != set ]]; then
 		migrate_directory lib usr/lib || exit 1
 	fi
 	if [[ -e lib32 ]]; then
-		if [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
+		if [[ $(grep -i ^Architecture: "$scratch_directory/control" | grep -q i386; echo $?) == 0 ]]; then
 			migrate_directory lib32 usr/lib || exit 1
 		else
 			migrate_directory lib32 usr/lib32 || exit 1
@@ -429,13 +488,13 @@ if [[ $pseudo != set ]]; then
 	if [[ -e lib64 ]]; then
 		migrate_directory lib64 usr/lib || exit 1
 	fi
-	if [[ -e usr/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
+	if [[ -e usr/lib32 ]] && [[ $(grep -i ^Architecture: "$scratch_directory/control" | grep -q i386; echo $?) == 0 ]]; then
 		migrate_directory usr/lib32 usr/lib || exit 1
 	fi
 	if [[ -e usr/lib64 ]]; then
 		migrate_directory usr/lib64 usr/lib || exit 1
 	fi
-	if [[ -e usr/local/lib32 ]] && [[ $(grep -i ^Architecture: control | grep -q i386; echo $?) == 0 ]]; then
+	if [[ -e usr/local/lib32 ]] && [[ $(grep -i ^Architecture: "$scratch_directory/control" | grep -q i386; echo $?) == 0 ]]; then
 		migrate_directory usr/local/lib32 usr/local/lib || exit 1
 	fi
 	if [[ -e usr/local/lib64 ]]; then
@@ -458,7 +517,7 @@ fi
 
 if [[ $pkgbuild == set ]] || [[ $Pkgbuild == set ]]; then
 	if [[ -e usr/local ]] && [[ ! $(ls -A usr/local 2> /dev/null) ]]; then
-		echo 'rm -rf usr/local' >> pkgbuildinstallations2
+		echo 'rm -rf usr/local' >> "$scratch_directory/pkgbuildinstallations2"
 	fi
 fi
 
@@ -466,11 +525,13 @@ if [[ -e usr/local ]] && [[ ! $(ls -A usr/local 2> /dev/null) ]]; then
 	rm -rf usr/local
 fi
 
+cd "$scratch_directory" || exit 1
+
 # Generating .PKGINFO file
 echo -e "${lightgreen}==>${NC} ${bold}Generating .PKGINFO file...${normal}"
 
 # Generating pkgname field
-if [[ $pseudo == set ]] && [[ $(ls -A usr/lib32 2> /dev/null) ]] && [[ ! $(ls -A usr/bin 2> /dev/null) ]]; then
+if [[ $pseudo == set ]] && [[ $(ls -A "$payload_directory/usr/lib32" 2> /dev/null) ]] && [[ ! $(ls -A "$payload_directory/usr/bin" 2> /dev/null) ]]; then
 	for i in {git,bzr,darcs,hg}; do
 		if [[ $(grep -i ^Version: control | gawk -F : '{print $2}' | sed s'/^ //' | grep -q $i; echo $?) == 0 ]]; then
 			echo "pkgname = lib32-$(grep -i ^Package: control | gawk -F : '{print $2}' | sed s'/^ //' | tr '[:upper:]' '[:lower:]')"-$i | sed s"/-$i-$i$/-$i/" | sed s'/--/-/g' > .PKGINFO
@@ -562,53 +623,9 @@ else
 	echo "arch = x86_64" >> .PKGINFO
 fi
 
-# Generating size field
-if [[ -e preinst ]]; then
-    preinst_size=$(ls -l | grep preinst | gawk '{print $5}')
-else
-    preinst_size=0
-fi
-if [[ -e postinst ]]; then
-    postinst_size=$(ls -l | grep postinst | gawk '{print $5}')
-else
-    postinst_size=0
-fi
-if [[ -e prerm ]]; then
-    prerm_size=$(ls -l | grep prerm | gawk '{print $5}')
-else
-    prerm_size=0
-fi
-if [[ -e postrm ]]; then
-    postrm_size=$(ls -l | grep postrm | gawk '{print $5}')
-else
-    postrm_size=0
-fi
-if [[ -e conffiles ]]; then
-    conffiles_size=$(ls -l | grep conffiles | gawk '{print $5}')
-else
-    conffiles_size=0
-fi
-if [[ -e pkgbuildinstallations1 ]]; then
-    pkgbuildinstallations1_size=$(ls -l | grep pkgbuildinstallations1 | gawk '{print $5}')
-else
-    pkgbuildinstallations1_size=0
-fi
-if [[ -e pkgbuildinstallations2 ]]; then
-    pkgbuildinstallations2_size=$(ls -l | grep pkgbuildinstallations2 | gawk '{print $5}')
-else
-    pkgbuildinstallations2_size=0
-fi
-if [[ -e pkgbuildinstallations32 ]]; then
-    pkgbuildinstallations32_size=$(ls -l | grep pkgbuildinstallations32 | gawk '{print $5}')
-else
-    pkgbuildinstallations32_size=0
-fi
-if [[ -e pkgbuildinstallations64 ]]; then
-    pkgbuildinstallations64_size=$(ls -l | grep pkgbuildinstallations64 | gawk '{print $5}')
-else
-    pkgbuildinstallations64_size=0
-fi
-echo "size =" $(($(du -sb | tr -d " .") - $(ls -l | grep control | gawk '{print $5}') - $preinst_size - $postinst_size - $prerm_size - $postrm_size - $conffiles_size - $pkgbuildinstallations1_size - $pkgbuildinstallations2_size - $pkgbuildinstallations32_size - $pkgbuildinstallations64_size - $(ls -la | grep .PKGINFO | gawk '{print $5}') - 4096)) >> .PKGINFO
+# Generating size field from the payload only.
+payload_size=$(du -sb -- "$payload_directory") || exit 1
+printf 'size = %s\n' "${payload_size%%[[:space:]]*}" >> .PKGINFO
 
 # Generating license field
 if [[ $quiet == set ]] || [[ $Quiet == set ]]; then
@@ -3019,7 +3036,10 @@ fi
 
 # Generating mandatory dependencies fields
 # Creating test package for check with namcap
-tar --force-local -pcf test.pkg.tar --exclude='pkgbuildinstallations*' --exclude={control,preinst,postinst,prerm,posrtrm,conffiles,*-untranslated-names-only} * .PKGINFO 2> /dev/null
+if ! write_payload_archive "$scratch_directory/test.pkg.tar"; then
+	printf 'Error: Cannot create package for dependency analysis\n' >&2
+	exit 1
+fi
 namcap -r sodepends -m test.pkg.tar | grep 'dependency-detected-not-included\|library-no-package-associated' | gawk '{print $3,$4}' > namcap-checks
 rm -rf test.pkg.tar
 grep 'dependency-detected-not-included' namcap-checks | gawk '{print $2}' | grep -v -E '^glibc$\|^gcc(-libs)?$' > namcap-dependencies
@@ -3076,59 +3096,55 @@ if [[ $(grep -q '^Recommends:\|^Suggests:' control; echo $?) == 0 ]]; then
 fi
 touch optional-dependencies-untranslated-names-only-1
 
-# Moving report files to /tmp/debtap
-rm -rf /tmp/debtap 2> /dev/null
-mkdir /tmp/debtap 2> /dev/null
-if [[ $? != 0 ]]; then
-	echo -e "${red}Error: Cannot create /tmp/debtap, permission denied${NC}"
-fi
-mv *untranslated* /tmp/debtap 2> /dev/null
-mv *missing-files /tmp/debtap 2> /dev/null
+# Keep each conversion's reports inside its private workspace.
+for report in *untranslated* *missing-files; do
+	[[ ! -e $report ]] || mv -- "$report" "$report_directory/" || exit 1
+done
 
 # Report of (warning messages for) untranslated packages names and packages with missing files (if any exist)
-if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]]; then
+if [[ $(cat "$report_directory/dependencies-untranslated-names-only") != "" ]]; then
     echo -e "\n${lightred}Warning: These dependencies (depend =   fields) could not be translated into Arch Linux packages names:${NC}"
-    print_package_report /tmp/debtap/dependencies-untranslated-names-only
+    print_package_report "$report_directory/dependencies-untranslated-names-only"
 fi
-if [[ -e /tmp/debtap/dependencies-missing-files ]]; then
-    if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]]; then
+if [[ -e "$report_directory/dependencies-missing-files" ]]; then
+    if [[ $(cat "$report_directory/dependencies-untranslated-names-only") != "" ]]; then
 	echo -e "${lightred}Warning: These packages names could not be included as dependencies, because debtap has translated them into the same name with the package for conversion. This happens sometimes when you convert packages that already exist in your repositories (which is a bad idea in general). The following packages contain files that are already included in the package from your repositories (without these files your converted package may be dysfunctional):${NC}"
     else
 	echo -e "\n${lightred}Warning: These packages names could not be included as dependencies, because debtap has translated them into the same name with the package for conversion. This happens sometimes when you convert packages that already exist in your repositories (which is a bad idea in general). The following packages contain files that are already included in the package from your repositories (without these files your converted package may be dysfunctional):${NC}"
     fi
-    echo $(cat /tmp/debtap/dependencies-missing-files) | sed s'/ /, /g'
+    echo $(cat "$report_directory/dependencies-missing-files") | sed s'/ /, /g'
 fi
-if [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]]; then
-    if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]] || [[ -e /tmp/debtap/dependencies-missing-files ]]; then
+if [[ $(cat "$report_directory/optional-dependencies-untranslated-names-only-1") != "" ]]; then
+    if [[ $(cat "$report_directory/dependencies-untranslated-names-only") != "" ]] || [[ -e "$report_directory/dependencies-missing-files" ]]; then
 	echo -e "${lightred}Warning: These optional dependencies (optdepend =   fields) could not be translated into Arch Linux packages names:${NC}"
     else
 	echo -e "\n${lightred}Warning: These optional dependencies (optdepend =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    print_package_report /tmp/debtap/optional-dependencies-untranslated-names-only-1
+    print_package_report "$report_directory/optional-dependencies-untranslated-names-only-1"
 fi
-if [[ $(cat /tmp/debtap/replacements-untranslated-names-only) != "" ]]; then
-    if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]] || [[ -e /tmp/debtap/dependencies-missing-files ]] || [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]]; then
+if [[ $(cat "$report_directory/replacements-untranslated-names-only") != "" ]]; then
+    if [[ $(cat "$report_directory/dependencies-untranslated-names-only") != "" ]] || [[ -e "$report_directory/dependencies-missing-files" ]] || [[ $(cat "$report_directory/optional-dependencies-untranslated-names-only-1") != "" ]]; then
 	echo -e "${lightred}Warning: These replacements (replaces =   fields) could not be translated into Arch Linux packages names:${NC}"
     else
 	echo -e "\n${lightred}Warning: These replacements (replaces =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    print_package_report /tmp/debtap/replacements-untranslated-names-only
+    print_package_report "$report_directory/replacements-untranslated-names-only"
 fi
-if [[ $(cat /tmp/debtap/conflicts-untranslated-names-only) != "" ]]; then
-    if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]] || [[ -e /tmp/debtap/dependencies-missing-files ]] || [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]] || [[ $(cat /tmp/debtap/replacements-untranslated-names-only) != "" ]]; then
+if [[ $(cat "$report_directory/conflicts-untranslated-names-only") != "" ]]; then
+    if [[ $(cat "$report_directory/dependencies-untranslated-names-only") != "" ]] || [[ -e "$report_directory/dependencies-missing-files" ]] || [[ $(cat "$report_directory/optional-dependencies-untranslated-names-only-1") != "" ]] || [[ $(cat "$report_directory/replacements-untranslated-names-only") != "" ]]; then
 	echo -e "${lightred}Warning: These conflicts (conflict =   fields) could not be translated into Arch Linux packages names:${NC}"
     else
 	echo -e "\n${lightred}Warning: These conflicts (conflict =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    print_package_report /tmp/debtap/conflicts-untranslated-names-only
+    print_package_report "$report_directory/conflicts-untranslated-names-only"
 fi
-if [[ $(cat /tmp/debtap/provisions-untranslated-names-only) != "" ]]; then
-    if [[ $(cat /tmp/debtap/dependencies-untranslated-names-only) != "" ]] || [[ -e /tmp/debtap/dependencies-missing-files ]] || [[ $(cat /tmp/debtap/optional-dependencies-untranslated-names-only-1) != "" ]] || [[ $(cat /tmp/debtap/replacements-untranslated-names-only) != "" ]] || [[ $(cat /tmp/debtap/conflicts-untranslated-names-only) != "" ]]; then
+if [[ $(cat "$report_directory/provisions-untranslated-names-only") != "" ]]; then
+    if [[ $(cat "$report_directory/dependencies-untranslated-names-only") != "" ]] || [[ -e "$report_directory/dependencies-missing-files" ]] || [[ $(cat "$report_directory/optional-dependencies-untranslated-names-only-1") != "" ]] || [[ $(cat "$report_directory/replacements-untranslated-names-only") != "" ]] || [[ $(cat "$report_directory/conflicts-untranslated-names-only") != "" ]]; then
 	echo -e "${lightred}Warning: These provisions (provides =   fields) could not be translated into Arch Linux packages names:${NC}"
     else
 	echo -e "\n${lightred}Warning: These provisions (provides =   fields) could not be translated into Arch Linux packages names:${NC}"
     fi
-    print_package_report /tmp/debtap/provisions-untranslated-names-only
+    print_package_report "$report_directory/provisions-untranslated-names-only"
 fi
 
 # Generating .INSTALL file (if necessary)
@@ -3315,32 +3331,36 @@ if [[ $Quiet != set ]]; then
     fi
 fi
 
-# Removing metadata of original .deb package
-rm -rf control preinst postinst prerm postrm conffiles
+# Validate identity again because the user may have edited .PKGINFO.
+package_name=$(pkginfo_values pkgname)
+package_version=$(pkginfo_values pkgver)
+package_arch=$(pkginfo_values arch)
+validate_package_identity "$package_name" "$package_version" "$package_arch" || exit 1
 
-# Generating .MTREE file
-echo -e "\n${lightgreen}==>${NC} ${bold}Generating .MTREE file...${normal}"
-
-bsdtar -czf .MTREE --format=mtree --options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' * .PKGINFO .INSTALL 2> /dev/null
-
-# Creating final package in a fakeroot environment
 if [[ $Pkgbuild != set ]]; then
-echo -e "\n${lightgreen}==>${NC} ${bold}Creating final package...${normal}"
-fakeroot << EOF
-tar --force-local -pcf $(grep '^pkgname =' .PKGINFO | gawk '{print $3}')-$(grep '^pkgver =' .PKGINFO | gawk '{print $3}')-$(grep '^arch =' .PKGINFO | gawk '{print $3}').pkg.tar --exclude='pkgbuildinstallations*' * .PKGINFO .INSTALL .MTREE 2> /dev/null
-zstd -q -T0 --ultra -15 *.tar
-EOF
-if [[ $output == set ]]; then
-	mv *.zst "$outputdirectory"
-	if [[ $? != 0 ]]; then
-		echo -e "${red}Error: Cannot move generated package to output directory, permission denied. Exiting...${NC}";	exit 1
+	echo -e "\n${lightgreen}==>${NC} ${bold}Generating .MTREE file...${normal}"
+	if ! write_package_mtree; then
+		printf 'Error: Cannot generate .MTREE\n' >&2
+		exit 1
 	fi
-else
-	mv *.zst "$(dirname "$package_with_full_path")"
-	if [[ $? != 0 ]]; then
-		echo -e "${red}Error: Cannot move generated package to the same directory as .deb package, permission denied. Exiting...${NC}";	exit 1
+	echo -e "\n${lightgreen}==>${NC} ${bold}Creating final package...${normal}"
+	if ! write_payload_archive "$scratch_directory/package.tar" yes; then
+		printf 'Error: Cannot create package archive\n' >&2
+		exit 1
 	fi
-fi
+	package_filename="$package_name-$package_version-$package_arch.pkg.tar.zst"
+	package_destination=${outputdirectory:-$(dirname "$package_with_full_path")}
+	publication_directory=$(mktemp -d "$package_destination/.debtap-output.XXXXXXXX") || exit 1
+	if ! zstd -q -T0 --ultra -15 "$scratch_directory/package.tar" -o "$publication_directory/$package_filename"; then
+		printf 'Error: Cannot compress package archive\n' >&2
+		exit 1
+	fi
+	chmod 644 -- "$publication_directory/$package_filename" || exit 1
+	# A hard link publishes the complete file atomically and refuses overwrites.
+	if ! ln -T -- "$publication_directory/$package_filename" "$package_destination/$package_filename"; then
+		printf 'Error: Cannot publish package (already exists or permission denied)\n' >&2
+		exit 1
+	fi
 fi
 
 # Announcement of successful creation of package
@@ -3351,8 +3371,6 @@ fi
 if [[ $pkgbuild != set ]] && [[ $Pkgbuild != set ]]; then
 	# Removing leftover files
 	echo -e "${lightgreen}==>${NC} ${bold}Removing leftover files...${normal}"
-	rm -rf "$working_directory"
-	rm -rf /tmp/debtap
 	exit 0
 fi
 
@@ -3370,7 +3388,7 @@ pkgname=$(pkginfo_values pkgname)
 pkgbuild_arch=$(pkginfo_values arch)
 pkgbuild_dual_arch=
 if [[ $pkgname != lib32-* && $pkgname != *-multilib ]]; then
-	if [[ $(ls -A usr/bin 2> /dev/null) ]]; then pkgname+=-bin; fi
+	if [[ $(ls -A "${payload_directory:-.}/usr/bin" 2> /dev/null) ]]; then pkgname+=-bin; fi
 	if [[ $pkgbuild_arch == i686 || $pkgbuild_arch == x86_64 ]]; then
 		pkgbuild_dual_arch=set
 	fi
@@ -3499,20 +3517,17 @@ if [[ -e pkgbuildinstallations1 ]] || [[ -e pkgbuildinstallations2 ]] || [[ -e p
 	fi
 fi
 echo -e "\n}" >> PKGBUILD
-echo "$output_directory"
 # Moving PKGBUILD (and .INSTALL, if it exists) and announcing its creation
 if [[ $output == set ]]; then
 	pkgbuild_location="$outputdirectory/$pkgname-PKGBUILD"
 	# mkdir refuses existing directories and symlinks, preserving earlier edits.
 	if ! mkdir -- "$pkgbuild_location"; then
 		echo -e "${red}Error: Cannot create PKGBUILD directory in output directory (already exists or permission denied). Removing leftover files and exiting...${NC}"
-		rm -rf "$working_directory"
-		rm -rf /tmp/debtap
 		exit 1
 	fi
-	mv PKGBUILD "$pkgbuild_location"
+	mv -- PKGBUILD "$pkgbuild_location" || exit 1
 	if [[ -e .INSTALL ]]; then
-		mv .INSTALL "$pkgbuild_location/$pkgname.install"
+		mv -- .INSTALL "$pkgbuild_location/$pkgname.install" || exit 1
 		echo -e "${lightgreen}==>${NC} ${bold}PKGBUILD and "$pkgname.install" are now located in${normal} ${lightblue}\"$pkgbuild_location\"${NC} ${bold}and ready to be edited${normal}"
 	else
 		echo -e "${lightgreen}==>${NC} ${bold}PKGBUILD is now located in${normal} ${lightblue}\"$pkgbuild_location\"${NC} ${bold}and ready to be edited${normal}"
@@ -3522,13 +3537,11 @@ else
 	# mkdir refuses existing directories and symlinks, preserving earlier edits.
 	if ! mkdir -- "$pkgbuild_location"; then
 		echo -e "${red}Error: Cannot create PKGBUILD directory beside .deb package (already exists or permission denied). Removing leftover files and exiting...${NC}"
-		rm -rf "$working_directory"
-		rm -rf /tmp/debtap
 		exit 1
 	fi
-	mv PKGBUILD "$pkgbuild_location"
+	mv -- PKGBUILD "$pkgbuild_location" || exit 1
 	if [[ -e .INSTALL ]]; then
-		mv .INSTALL "$pkgbuild_location/$pkgname.install"
+		mv -- .INSTALL "$pkgbuild_location/$pkgname.install" || exit 1
 		echo -e "${lightgreen}==>${NC} ${bold}PKGBUILD and "$pkgname.install" are now located in${normal} ${lightblue}\"$pkgbuild_location\"${NC} ${bold}and ready to be edited${normal}"
 	else
 		echo -e "${lightgreen}==>${NC} ${bold}PKGBUILD is now located in${normal} ${lightblue}\"$pkgbuild_location\"${NC} ${bold}and ready to be edited${normal}"
@@ -3537,6 +3550,4 @@ fi
 
 # Removing leftover files
 echo -e "${lightgreen}==>${NC} ${bold}Removing leftover files...${normal}"
-rm -rf "$working_directory"
-rm -rf /tmp/debtap
 exit 0
