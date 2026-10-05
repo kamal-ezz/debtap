@@ -340,6 +340,22 @@ HOOKS
     fi
 }
 
+# Detect recognizable APT commands and paths without rewriting shell code.
+# Ignore full-line comments; indirect or dynamically constructed commands still
+# require a human portability review.
+has_apt_setup() {
+    [[ -f $1 ]] || return 1
+    grep -Ev '^[[:space:]]*#' "$1" | grep -Eq '/(etc|var/lib|var/cache|var/log)/apt(/|[^[:alnum:]_-]|$)|(^|[^[:alnum:]_-])(apt-get|apt-cache|apt-key|aptitude|add-apt-repository|apt)([[:space:];|&)]|$)'
+}
+
+validate_install_portability() {
+    if has_apt_setup .INSTALL; then
+        printf 'Error: .INSTALL still contains APT commands or paths that require adaptation for Arch. No package or PKGBUILD was created.\n' >&2
+        printf 'Run without -Q, select a metadata editor, and adapt the Debian repository/package-manager setup while preserving the other install hooks.\n' >&2
+        return 1
+    fi
+}
+
 validate_install_script() {
     [[ -e .INSTALL ]] || return 0
     if ! bash -n .INSTALL; then
@@ -3353,6 +3369,7 @@ fi
 
 # Validate metadata again because the user may have edited it.
 validate_install_script || exit 1
+validate_install_portability || exit 1
 package_name=$(pkginfo_values pkgname)
 package_version=$(pkginfo_values pkgver)
 package_arch=$(pkginfo_values arch)

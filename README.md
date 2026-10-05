@@ -64,7 +64,14 @@ Scripts are not executed during conversion.
 
 Review `.INSTALL` for Arch compatibility before installing. Commands that
 configure APT repositories, use debconf, or assume Debian services are preserved
-and flagged for review; syntax validation does not make them portable. Debian
+and flagged for review; syntax validation does not make them portable. After
+metadata editing, debtap refuses to create a package or PKGBUILD if `.INSTALL`
+still contains recognizable APT commands or APT configuration/cache paths.
+Run without `-Q` and adapt those sections in the metadata editor. The check
+ignores full-line comments and does not execute scripts. It cannot recognize
+all indirect or dynamically constructed commands; other Debian assumptions
+still require manual review. Debtap does not delete arbitrary shell blocks.
+Debian
 purge, rollback, triggers, and old-package upgrade removal scripts are not
 emulated. Arch's transaction hooks handle desktop and icon cache updates.
 

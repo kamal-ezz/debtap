@@ -420,6 +420,42 @@ printf 'options:%s\\n' "$-"
         self.assertIn('.INSTALL has invalid shell syntax', result.stderr)
         self.assertEqual(existing.read_text(), 'previous package')
 
+    def test_apt_detection_handles_commands_paths_and_comments(self):
+        for body in ('apt-get update', '/usr/bin/apt install demo',
+                     'apt-key add key', 'add-apt-repository ppa:demo',
+                     "SOURCES='/etc/apt/sources.list.d/demo.sources'",
+                     'mkdir -p /var/lib/apt/lists'):
+            with self.subTest(body=body):
+                self.write('.INSTALL', 'post_install() {\n' + body + '\n}\n')
+                result = self.bash(HELPERS + '\nvalidate_install_portability')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('adaptation for Arch', result.stderr)
+        self.write('.INSTALL', '# apt-get update\npost_install() { echo adapted; }\n')
+        self.assert_ok(self.bash(HELPERS + '\nvalidate_install_portability'))
+
+    def test_generic_apt_script_cannot_be_published_without_adaptation(self):
+        script = self.conversion_script()
+        deb = self.make_deb(control={
+            'control': 'Package: demoapp\nVersion: 1.0\nArchitecture: all\n'
+                       'Description: Sample package\n',
+            'postinst': '#!/bin/sh\nset -e\napt-get update\necho keep-hook\n'})
+        previous = self.write('demoapp-1.0-1-any.pkg.tar.zst', 'previous package')
+        for mode in ('-p', '-P'):
+            with self.subTest(mode=mode):
+                result = self.bash('bash "$1" -Q "$2" "$3"', [script, mode, deb])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('.INSTALL still contains APT', result.stderr)
+                self.assertEqual(previous.read_text(), 'previous package')
+                self.assertFalse((self.root / 'demoapp-PKGBUILD').exists())
+        self.env['EDITOR'] = 'adapt-apt'
+        self.mock_command('adapt-apt',
+                          '[[ $1 != .INSTALL ]] || sed -i "/^apt-get update$/d" "$1"\n')
+        self.assert_ok(self.bash('bash "$1" -q -p "$2"', [script, deb], input='3'))
+        with self.package_contents() as tar:
+            install = tar.extractfile('.INSTALL').read()
+            self.assertIn(b'echo keep-hook', install)
+            self.assertNotIn(b'apt-get update', install)
+
     def test_reserved_payload_metadata_is_rejected(self):
         script = self.conversion_script()
         for name in ('.PKGINFO', '.INSTALL', '.MTREE'):
