@@ -150,6 +150,43 @@ extract_deb_member data.tar.gz 'tar -xz'
         self.assertEqual(result.returncode, 0, result.stderr)
         return tarfile.open(fileobj=io.BytesIO(result.stdout))
 
+    def test_epoch_dependencies_preserve_comparison_operators(self):
+        dependencies = [
+            ('libusb-1.0-0', 'libusb', '>= 2:1.0.16', '>=1.0.16'),
+            ('libx11-6', 'libx11', '>= 2:1.4.99.1', '>=1.4.99.1'),
+            ('libxcomposite1', 'libxcomposite', '>= 1:0.4.4-1', '>=0.4.4'),
+            ('libxdamage1', 'libxdamage', '>= 1:1.1', '>=1.1'),
+            ('libnspr4', 'nspr', '>= 2:4.9-2~', '>=4.9'),
+            ('libnss3', 'nss', '>= 2:3.30', '>=3.30'),
+        ]
+        for database in ('debian-main-packages-files', 'ubuntu-packages-files'):
+            with self.subTest(database=database):
+                script = self.conversion_script()
+                contents = ''.join(f'usr/bin/{arch_name} section/{deb_name}\n'
+                                   for deb_name, arch_name, _, _ in dependencies)
+                self.write('cache/' + database, contents)
+                self.mock_command('pkgfile', 'printf "extra/%s\\n" "$1"\n')
+                control = ('Package: demoapp\nVersion: 1.0\nArchitecture: all\n'
+                           'Description: Sample package\nDepends: ' + ', '.join(
+                               f'{name} ({constraint})' for name, _, constraint, _
+                               in dependencies) + '\n')
+                deb = self.make_deb(control={'control': control})
+                output = self.root / database
+                output.mkdir()
+                self.assert_ok(self.bash('bash "$1" -Q -p -o "$2" "$3"',
+                                         [script, output, deb]))
+                with self.package_contents(output) as tar:
+                    pkginfo = tar.extractfile('.PKGINFO').read().decode()
+                actual = {line.removeprefix('depend = ') for line in pkginfo.splitlines()
+                          if line.startswith('depend = ')}
+                self.assertEqual(actual, {name + constraint for _, name, _, constraint
+                                          in dependencies})
+                pkgbuild = output / 'demoapp-PKGBUILD/PKGBUILD'
+                result = self.bash('source "$1"; printf "%s\\n" "${depends[@]}"',
+                                   [pkgbuild])
+                self.assert_ok(result)
+                self.assertEqual(set(result.stdout.splitlines()), actual)
+
     def test_existing_working_directory_is_preserved(self):
         script = self.conversion_script()
         deb = self.make_deb()
