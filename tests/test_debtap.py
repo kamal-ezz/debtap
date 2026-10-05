@@ -325,6 +325,101 @@ extract_deb_member data.tar.gz 'tar -xz'
         self.assertEqual((self.root / 'demoapp-PKGBUILD/demoapp.install').read_bytes(),
                          install)
 
+    def test_install_wrapper_preserves_shell_structure_and_heredocs(self):
+        source = '''#!/bin/sh
+set -e
+GENERATED_FILE=generated-output
+mark_repository_added() {
+    if [ "$1" = configure ]; then
+        cat > "$GENERATED_FILE" <<'END'
+# automatically generated; added by postinst
+/etc/apt/sources.list.d/example.sources
+END
+    else
+        exit 7
+    fi
+}
+case "$1" in
+    configure) mark_repository_added "$1" ;;
+    *) exit 8 ;;
+esac
+exit 0'''
+        self.write('postinst', source)
+        result = self.bash(HELPERS + '\ngenerate_install_script\n')
+        self.assert_ok(result)
+        self.assertIn('Debian-specific', result.stderr)
+        self.assertIn(source, (self.root / '.INSTALL').read_text())
+        self.assertFalse((self.root / 'generated-output').exists())
+        self.assert_ok(self.bash('source .INSTALL\npost_install 2.0\nprintf survived'))
+        self.assertEqual((self.root / 'generated-output').read_text(),
+                         '# automatically generated; added by postinst\n'
+                         '/etc/apt/sources.list.d/example.sources\n')
+
+    def test_install_wrappers_pass_debian_lifecycle_arguments(self):
+        for script in ('preinst', 'postinst', 'prerm', 'postrm'):
+            self.write(script, '#!/bin/sh\nset -eu\n'
+                       f'printf "{script}:%s:%s:%s\\n" "$1" "${{2-}}" "${{3-}}"\n'
+                       'exit 0\n')
+        self.assert_ok(self.bash(HELPERS + '\ngenerate_install_script'))
+        result = self.bash('''source .INSTALL
+pre_install 2.0
+post_install 2.0
+pre_upgrade 2.0 1.0
+post_upgrade 2.0 1.0
+pre_remove 2.0
+post_remove 2.0
+printf 'options:%s\\n' "$-"
+''')
+        self.assert_ok(result)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[:6], ['preinst:install::', 'postinst:configure::',
+                                    'preinst:upgrade:1.0:2.0', 'postinst:configure:1.0:',
+                                    'prerm:remove::', 'postrm:remove::'])
+        self.assertNotIn('e', lines[6].split(':')[1])
+        self.assertNotIn('u', lines[6].split(':')[1])
+
+    def test_comment_only_maintainer_script_is_valid(self):
+        self.write('postinst', '#!/bin/sh\n# Nothing to configure')
+        self.assert_ok(self.bash(HELPERS + '\ngenerate_install_script'))
+        self.assert_ok(self.bash('source .INSTALL\npost_install 1.0'))
+
+    def test_install_wrapper_propagates_failure(self):
+        self.write('postinst', '#!/bin/sh\nset -e\nfalse\necho unreachable\n')
+        self.assert_ok(self.bash(HELPERS + '\ngenerate_install_script'))
+        result = self.bash('source .INSTALL\npost_install 1.0')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('unreachable', result.stdout)
+
+    def test_invalid_or_non_shell_maintainer_scripts_stop_conversion(self):
+        script = self.conversion_script()
+        for content, error in [('if true; then\nelse\nfi\n', 'invalid shell syntax'),
+                               ('#!/usr/bin/python3\nprint("hello")\n',
+                                'unsupported interpreter')]:
+            with self.subTest(content=content):
+                deb = self.make_deb(control={
+                    'control': 'Package: demoapp\nVersion: 1.0\nArchitecture: all\n'
+                               'Description: Sample package\n',
+                    'postinst': content})
+                result = self.bash('bash "$1" -Q "$2"', [script, deb])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [])
+
+    def test_edited_install_script_is_checked_before_publication(self):
+        script = self.conversion_script()
+        deb = self.make_deb(control={
+            'control': 'Package: demoapp\nVersion: 1.0\nArchitecture: all\n'
+                       'Description: Sample package\n',
+            'postinst': '#!/bin/sh\necho installed\n'})
+        self.env['EDITOR'] = 'edit-install'
+        self.mock_command('edit-install',
+                          '[[ $1 != .INSTALL ]] || printf "else\\n" > "$1"\n')
+        existing = self.write('demoapp-1.0-1-any.pkg.tar.zst', 'previous package')
+        result = self.bash('bash "$1" -q "$2"', [script, deb], input='3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('.INSTALL has invalid shell syntax', result.stderr)
+        self.assertEqual(existing.read_text(), 'previous package')
+
     def test_reserved_payload_metadata_is_rejected(self):
         script = self.conversion_script()
         for name in ('.PKGINFO', '.INSTALL', '.MTREE'):

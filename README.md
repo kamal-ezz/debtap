@@ -56,6 +56,18 @@ If the destination is a symlink, the symlink is replaced and its target is
 preserved. Archive, compression, or publication failures return a nonzero exit
 status.
 
+Maintainer scripts are preserved as shell code inside isolated `.INSTALL`
+functions, with Debian action arguments for installation, configuration,
+upgrade, and removal. Debtap checks shell syntax before conversion and again
+after metadata editing. Non-shell interpreters require manual adaptation.
+Scripts are not executed during conversion.
+
+Review `.INSTALL` for Arch compatibility before installing. Commands that
+configure APT repositories, use debconf, or assume Debian services are preserved
+and flagged for review; syntax validation does not make them portable. Debian
+purge, rollback, triggers, and old-package upgrade removal scripts are not
+emulated. Arch's transaction hooks handle desktop and icon cache updates.
+
 Any recommendations or questions for debtap are welcomed!
 
 Available options:
@@ -71,6 +83,27 @@ Available options:
     -P  --Pkgbuild    Generate a PKGBUILD file only
     -o  --output      Output directory for generated package and/or PKGBUILD (optional)
     -v  --version     Print version
+
+ChatGPT recovery helper:
+========================
+
+After pulling the fixed debtap version, run as your normal desktop user:
+
+    ./scripts/reinstall-chatgpt.sh --build-only ~/Downloads/chatgpt_amd64.deb
+    ./scripts/reinstall-chatgpt.sh ~/Downloads/chatgpt_amd64.deb
+
+The first command only builds a package for inspection. The second rebuilds,
+removes the reviewed APT setup, installs through sudo/pacman with its normal
+confirmation, restores Firefox for HTTP/HTTPS, and launches ChatGPT. It retains
+the package, PKGBUILD, cleaned install script, logs, and desktop association
+backups in the printed temporary directory. Existing desktop preferences are
+changed only after installation succeeds.
+
+The adaptation recognizes the exact maintainer scripts from ChatGPT
+26.930.51102 and refuses changed scripts. AppArmor setup and removal are
+preserved. Future releases require a fresh review. Firefox must already be
+installed; set `FIREFOX_DESKTOP` if its desktop entry has another filename.
+The helper does not commit or push repository changes.
 
 Development checks:
 ===================
