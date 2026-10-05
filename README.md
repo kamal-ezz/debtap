@@ -49,11 +49,12 @@ Conversion uses a private temporary directory under `${TMPDIR:-/tmp}` and remove
 it on completion, failure, or interruption. Extracted package contents are kept
 separate from conversion metadata and scratch files.
 
-Existing output packages are preserved too: conversion fails if the destination
-filename already exists. Choose another output directory or rename the existing
-package before converting again. The complete compressed package is published
-using a hard link within the output filesystem, which must support hard links.
-Archive, compression, or publication failures return a nonzero exit status.
+Reconversion replaces an existing output package with the same filename. The
+complete compressed package is staged on the output filesystem, then published
+with an atomic rename. A failed conversion preserves the previous package.
+If the destination is a symlink, the symlink is replaced and its target is
+preserved. Archive, compression, or publication failures return a nonzero exit
+status.
 
 Any recommendations or questions for debtap are welcomed!
 

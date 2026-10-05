@@ -252,6 +252,8 @@ extract_deb_member data.tar.gz 'tar -xz'
         script = self.conversion_script()
         deb = self.make_deb()
         real_tar = shutil.which('tar')
+        real_mv = shutil.which('mv')
+        destination = self.write('demoapp-1.0-1-any.pkg.tar.zst', 'original package')
         for stage, command, code, error in (
             ('mtree', 'bsdtar', 'exit 1\n', 'Cannot generate .MTREE'),
             ('archive', 'tar', f'"{real_tar}" "$@" || exit $?\n'
@@ -261,7 +263,8 @@ extract_deb_member data.tar.gz 'tar -xz'
              'while (( $# )); do if [[ $1 == -o ]]; then shift; '
              'printf partial > "$1"; break; fi; shift; done\nexit 1\n',
              'Cannot compress package archive'),
-            ('publication', 'ln', 'exit 1\n', 'Cannot publish package'),
+            ('publication', 'mv', '[[ $1 != -fT ]] || exit 1\n'
+             f'exec "{real_mv}" "$@"\n', 'Cannot publish package'),
         ):
             with self.subTest(stage=stage):
                 self.mock_command(command, code)
@@ -270,28 +273,31 @@ extract_deb_member data.tar.gz 'tar -xz'
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(error, result.stderr)
                     self.assertNotIn('Package successfully created', result.stdout)
-                    self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [])
+                    self.assertEqual(list(self.root.glob('*.pkg.tar.zst')), [destination])
+                    self.assertEqual(destination.read_text(), 'original package')
                     self.assertEqual(list(self.root.glob('.debtap-output.*')), [])
                     self.assertEqual(list(self.work_temp.iterdir()), [])
                 finally:
                     (self.root / 'commands' / command).unlink()
 
-    def test_existing_package_and_symlink_are_preserved(self):
+    def test_existing_package_is_replaced_atomically(self):
         script = self.conversion_script()
         deb = self.make_deb()
         destination = self.write('demoapp-1.0-1-any.pkg.tar.zst', 'original package')
-        result = self.bash('bash "$1" -Q "$2"', [script, deb])
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Cannot publish package', result.stderr)
-        self.assertEqual(destination.read_text(), 'original package')
+        # An open reader continues to see the previous file after replacement.
+        with destination.open() as previous:
+            self.assert_ok(self.bash('bash "$1" -Q "$2"', [script, deb]))
+            self.assertEqual(previous.read(), 'original package')
+        with self.package_contents() as tar:
+            self.assertEqual(tar.extractfile('usr/lib/.hidden').read(), b'hidden')
         destination.unlink()
         target = self.write('original', 'preserve me')
         destination.symlink_to(target)
-        result = self.bash('bash "$1" -Q "$2"', [script, deb])
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Cannot publish package', result.stderr)
-        self.assertTrue(destination.is_symlink())
+        self.assert_ok(self.bash('bash "$1" -Q "$2"', [script, deb]))
+        self.assertFalse(destination.is_symlink())
         self.assertEqual(target.read_text(), 'preserve me')
+        with self.package_contents() as tar:
+            self.assertIn('.PKGINFO', tar.getnames())
         self.assertEqual(list(self.root.glob('.debtap-output.*')), [])
 
     def test_empty_payload_can_be_packaged(self):

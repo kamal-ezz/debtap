@@ -3455,9 +3455,9 @@ if [[ $Pkgbuild != set ]]; then
 		exit 1
 	fi
 	chmod 644 -- "$publication_directory/$package_filename" || exit 1
-	# A hard link publishes the complete file atomically and refuses overwrites.
-	if ! ln -T -- "$publication_directory/$package_filename" "$package_destination/$package_filename"; then
-		printf 'Error: Cannot publish package (already exists or permission denied)\n' >&2
+	# Staging on the output filesystem makes replacement an atomic rename.
+	if ! mv -fT -- "$publication_directory/$package_filename" "$package_destination/$package_filename"; then
+		printf 'Error: Cannot publish package: %s/%s\nCheck that the output directory is writable and the destination is not a directory.\n' "$package_destination" "$package_filename" >&2
 		exit 1
 	fi
 fi
